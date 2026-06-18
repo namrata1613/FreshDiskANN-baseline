@@ -1,0 +1,131 @@
+Starting index build: R=64 L=100 Query RAM budget: 1.07374e+09 Indexing RAM budget: 2 T: 4 Final index will be in multiple files
+(Normalized, if required) file : /home/nams/research/data/sift1m/sift_base.bin has: 1000000 points. Changing training set size to 100000 points
+Calculated num_pq_chunks :1073
+Compressing 128-dimensional data into 100 bytes per vector.
+Opened: /home/nams/research/data/sift1m/sift_base.bin, size: 512000008, cache_size: 67108864
+Generating PQ pivots with training data of size: 100145 num PQ chunks: 100
+Kmeans time: 197.511 Lloyds time: 111.516 Copy time: 0.174647
+ Stat(/home/nams/research/work/sift1m_idx/sift1m_pq_pivots.bin) returned: 0
+Writing bin: /home/nams/research/work/sift1m_idx/sift1m_pq_pivots.bin
+bin: #pts = 256, #dims = 128, size = 131080B
+Finished writing bin.
+ Stat(/home/nams/research/work/sift1m_idx/sift1m_pq_pivots.bin) returned: 0
+Writing bin: /home/nams/research/work/sift1m_idx/sift1m_pq_pivots.bin
+bin: #pts = 128, #dims = 1, size = 520B
+Finished writing bin.
+ Stat(/home/nams/research/work/sift1m_idx/sift1m_pq_pivots.bin) returned: 0
+Writing bin: /home/nams/research/work/sift1m_idx/sift1m_pq_pivots.bin
+bin: #pts = 128, #dims = 1, size = 520B
+Finished writing bin.
+ Stat(/home/nams/research/work/sift1m_idx/sift1m_pq_pivots.bin) returned: 0
+Writing bin: /home/nams/research/work/sift1m_idx/sift1m_pq_pivots.bin
+bin: #pts = 101, #dims = 1, size = 412B
+Finished writing bin.
+ Stat(/home/nams/research/work/sift1m_idx/sift1m_pq_pivots.bin) returned: 0
+Writing bin: /home/nams/research/work/sift1m_idx/sift1m_pq_pivots.bin
+bin: #pts = 5, #dims = 1, size = 48B
+Finished writing bin.
+Saved pq pivot data to /home/nams/research/work/sift1m_idx/sift1m_pq_pivots.bin of size 136628B.
+Pivots generated in 309.919s.
+Opened: /home/nams/research/data/sift1m/sift_base.bin, size: 512000008, cache_size: 67108864
+ Stat(/home/nams/research/work/sift1m_idx/sift1m_pq_pivots.bin) returned: 0
+Reading bin file /home/nams/research/work/sift1m_idx/sift1m_pq_pivots.bin ...
+Metadata: #pts = 5, #dims = 1...
+Reading bin file /home/nams/research/work/sift1m_idx/sift1m_pq_pivots.bin ...
+Metadata: #pts = 256, #dims = 128...
+Reading bin file /home/nams/research/work/sift1m_idx/sift1m_pq_pivots.bin ...
+Metadata: #pts = 128, #dims = 1...
+Reading bin file /home/nams/research/work/sift1m_idx/sift1m_pq_pivots.bin ...
+Metadata: #pts = 128, #dims = 1...
+Reading bin file /home/nams/research/work/sift1m_idx/sift1m_pq_pivots.bin ...
+Metadata: #pts = 101, #dims = 1...
+Loaded PQ pivot information
+Compressed data generated and written in: 65.1631s.
+Full index fits in RAM, building in one shot
+Getting distance function for metric: l2
+L2: Using AVX2 distance computation
+ Stat(/home/nams/research/data/sift1m/sift_base.bin) returned: 0
+Loading only first 1000000 from file.. 
+Number of syncs: 245
+Completed  (round: 0, sync: 3/245 with L 100) sync_time: 0.2552s; inter_time: 0.04522s
+Completed  (round: 0, sync: 15/245 with L 100) sync_time: 4.501s; inter_time: 0.03637s
+Completed  (round: 0, sync: 27/245 with L 100) sync_time: 7.752s; inter_time: 0.05927s
+Completed  (round: 0, sync: 40/245 with L 100) sync_time: 10.37s; inter_time: 0.06319s
+Completed  (round: 0, sync: 52/245 with L 100) sync_time: 11.27s; inter_time: 0.08514s
+Completed  (round: 0, sync: 64/245 with L 100) sync_time: 11.78s; inter_time: 0.08745s
+Completed  (round: 0, sync: 76/245 with L 100) sync_time: 12.48s; inter_time: 0.09059s
+Completed  (round: 0, sync: 89/245 with L 100) sync_time: 13.84s; inter_time: 0.09972s
+Completed  (round: 0, sync: 101/245 with L 100) sync_time: 13.26s; inter_time: 0.09818s
+Completed  (round: 0, sync: 113/245 with L 100) sync_time: 13.04s; inter_time: 0.09871s
+Completed  (round: 0, sync: 125/245 with L 100) sync_time: 14s; inter_time: 0.1207s
+Completed  (round: 0, sync: 138/245 with L 100) sync_time: 15.32s; inter_time: 0.1142s
+Completed  (round: 0, sync: 150/245 with L 100) sync_time: 14.41s; inter_time: 0.1015s
+Completed  (round: 0, sync: 162/245 with L 100) sync_time: 13.83s; inter_time: 0.1031s
+Completed  (round: 0, sync: 174/245 with L 100) sync_time: 16s; inter_time: 0.131s
+Completed  (round: 0, sync: 187/245 with L 100) sync_time: 16.73s; inter_time: 0.1201s
+Completed  (round: 0, sync: 199/245 with L 100) sync_time: 15.04s; inter_time: 0.1105s
+Completed  (round: 0, sync: 211/245 with L 100) sync_time: 15.5s; inter_time: 0.1232s
+Completed  (round: 0, sync: 223/245 with L 100) sync_time: 15.51s; inter_time: 0.1234s
+Completed  (round: 0, sync: 236/245 with L 100) sync_time: 18.72s; inter_time: 0.1426s
+Completed Pass 0 of data using L=100 and alpha=1. Stats: search+prune_time=253.6s, inter_time=1.954s, inter_count=15212
+Completed  (round: 1, sync: 3/245 with L 100) sync_time: 6.409s; inter_time: 0.1853s
+Completed  (round: 1, sync: 15/245 with L 100) sync_time: 17.8s; inter_time: 0.4547s
+Completed  (round: 1, sync: 27/245 with L 100) sync_time: 20.5s; inter_time: 0.5412s
+Completed  (round: 1, sync: 40/245 with L 100) sync_time: 23.84s; inter_time: 0.6019s
+Completed  (round: 1, sync: 52/245 with L 100) sync_time: 22.44s; inter_time: 0.657s
+Completed  (round: 1, sync: 64/245 with L 100) sync_time: 22.66s; inter_time: 0.771s
+Completed  (round: 1, sync: 76/245 with L 100) sync_time: 24.2s; inter_time: 0.9846s
+Completed  (round: 1, sync: 89/245 with L 100) sync_time: 26.93s; inter_time: 1.12s
+Completed  (round: 1, sync: 101/245 with L 100) sync_time: 25.17s; inter_time: 1.122s
+Completed  (round: 1, sync: 113/245 with L 100) sync_time: 25.08s; inter_time: 1.196s
+Completed  (round: 1, sync: 125/245 with L 100) sync_time: 26.65s; inter_time: 1.303s
+Completed  (round: 1, sync: 138/245 with L 100) sync_time: 28.86s; inter_time: 1.497s
+Completed  (round: 1, sync: 150/245 with L 100) sync_time: 26.65s; inter_time: 1.503s
+Completed  (round: 1, sync: 162/245 with L 100) sync_time: 25.64s; inter_time: 1.477s
+Completed  (round: 1, sync: 174/245 with L 100) sync_time: 28.91s; inter_time: 1.716s
+Completed  (round: 1, sync: 187/245 with L 100) sync_time: 30.73s; inter_time: 1.905s
+Completed  (round: 1, sync: 199/245 with L 100) sync_time: 27.17s; inter_time: 1.723s
+Completed  (round: 1, sync: 211/245 with L 100) sync_time: 27.63s; inter_time: 1.747s
+Completed  (round: 1, sync: 223/245 with L 100) sync_time: 27.73s; inter_time: 1.867s
+Completed  (round: 1, sync: 236/245 with L 100) sync_time: 33.71s; inter_time: 2.153s
+Completed Pass 1 of data using L=100 and alpha=1.2. Stats: search+prune_time=498.7s, inter_time=24.52s, inter_count=472495
+Starting final cleanup..done. Link time: 829.6s
+Index built with degree: max:64  avg:64  min:64  count(deg<2):0
+ Stat(/home/nams/research/work/sift1m_idx/sift1m_mem.index) returned: -1
+File /home/nams/research/work/sift1m_idx/sift1m_mem.index does not exist
+ Stat(/home/nams/research/work/sift1m_idx/sift1m_mem.index) returned: -1
+File /home/nams/research/work/sift1m_idx/sift1m_mem.index does not exist
+ Stat(/home/nams/research/work/sift1m_idx/sift1m_mem.index.data) returned: -1
+File /home/nams/research/work/sift1m_idx/sift1m_mem.index.data does not exist
+ Stat(/home/nams/research/work/sift1m_idx/sift1m_mem.index.data) returned: -1
+File /home/nams/research/work/sift1m_idx/sift1m_mem.index.data does not exist
+ Stat(/home/nams/research/work/sift1m_idx/sift1m_mem.index.tags) returned: -1
+File /home/nams/research/work/sift1m_idx/sift1m_mem.index.tags does not exist
+Not saving tags as they are not enabled.
+ Stat(/home/nams/research/work/sift1m_idx/sift1m_mem.index.del) returned: -1
+File /home/nams/research/work/sift1m_idx/sift1m_mem.index.del does not exist
+Time taken for save: 2.228s.
+Vamana index built in: 837.9s.
+Opened: /home/nams/research/data/sift1m/sift_base.bin, size: 512000008, cache_size: 67108864
+ Stat(/home/nams/research/work/sift1m_idx/sift1m_disk.index) returned: -1
+File /home/nams/research/work/sift1m_idx/sift1m_disk.index does not exist
+Opened: /home/nams/research/work/sift1m_idx/sift1m_disk.index, cache_size: 67108864
+medoid: 123742B
+max_node_len: 772B
+nnodes_per_sector: 5B
+# sectors: 200000
+Sector #0written
+Sector #100000written
+Finished writing 819204096B
+ Stat(/home/nams/research/work/sift1m_idx/sift1m_disk.index) returned: 0
+Writing bin: /home/nams/research/work/sift1m_idx/sift1m_disk.index
+bin: #pts = 9, #dims = 1, size = 80B
+Finished writing bin.
+Output file written.
+Finished writing 819204096B
+Generating warmup file with 1e+05 points using a sampling rate of: 0.1
+Opened: /home/nams/research/data/sift1m/sift_base.bin, size: 512000008, cache_size: 67108864
+Loading base /home/nams/research/data/sift1m/sift_base.bin. #points: 1000000. #dim: 128.
+Wrote 99867 points to sample file: /home/nams/research/work/sift1m_idx/sift1m_sample_data.bin
+Deleting memory index file: /home/nams/research/work/sift1m_idx/sift1m_mem.index
+Indexing time: 1217

@@ -215,7 +215,7 @@ int search_disk_index(int argc, char** argv) {
          "==========================================="
       << std::endl;
 
-  std::vector<std::vector<uint32_t>> query_result_ids(Lvec.size());
+  std::vector<std::vector<uint64_t>> query_result_ids(Lvec.size());
   std::vector<std::vector<uint32_t>> query_result_tags(Lvec.size());
   std::vector<std::vector<float>>    query_result_dists(Lvec.size());
 
@@ -243,9 +243,9 @@ int search_disk_index(int argc, char** argv) {
     auto                  s = std::chrono::high_resolution_clock::now();
 #pragma omp parallel for schedule(dynamic, 1)
     for (_s64 i = 0; i < (int64_t) query_num; i++) {
-      _pFlashIndex->cached_beam_search(
+      _pFlashIndex->cached_beam_search_ids(
           query + (i * query_aligned_dim), (uint64_t) recall_at, (uint64_t) L,
-          query_result_tags_32.data() + (i * recall_at),
+          query_result_ids[test_id].data() + (i * recall_at),
           query_result_dists[test_id].data() + (i * recall_at),
           (uint64_t) optimized_beamwidth, stats + i);
     }
@@ -285,10 +285,16 @@ int search_disk_index(int argc, char** argv) {
 
     float recall = 0;
     if (calc_recall_flag) {
+      std::vector<uint32_t> query_result_ids_32(recall_at * query_num);
+      diskann::convert_types<uint64_t, uint32_t>(
+    	  query_result_ids[test_id].data(),
+          query_result_ids_32.data(),
+          (size_t) query_num,
+          (size_t) recall_at);
       recall = (float) diskann::calculate_recall(
-          (_u32) query_num, gt_ids, gt_dists, (_u32) gt_dim,
-          query_result_tags[test_id].data(), (_u32) recall_at,
-          (_u32) recall_at);
+    	  (_u32) query_num, gt_ids, gt_dists, (_u32) gt_dim,
+    	  query_result_ids_32.data(), (_u32) recall_at,
+    	  (_u32) recall_at);
     }
 
     diskann::cout << std::setw(6) << L << std::setw(12) << optimized_beamwidth
@@ -306,9 +312,11 @@ int search_disk_index(int argc, char** argv) {
   for (auto L : Lvec) {
     std::string cur_result_path =
         result_output_prefix + "_" + std::to_string(L) + "_idx_uint32.bin";
-    diskann::save_bin<_u32>(cur_result_path, query_result_ids[test_id].data(),
-                            query_num, recall_at);
+    std::vector<uint32_t> query_result_ids_32_save(recall_at * query_num);
+    diskann::convert_types<uint64_t, uint32_t>( query_result_ids[test_id].data(), query_result_ids_32_save.data(), (size_t) query_num, (size_t) recall_at);
 
+    diskann::save_bin<_u32>(cur_result_path, query_result_ids_32_save.data(), query_num, recall_at);
+    
     cur_result_path =
         result_output_prefix + "_" + std::to_string(L) + "_tags_uint32.bin";
     diskann::save_bin<_u32>(cur_result_path, query_result_tags[test_id].data(),

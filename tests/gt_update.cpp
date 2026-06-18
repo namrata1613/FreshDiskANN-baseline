@@ -20,7 +20,7 @@ void check_and_gen(char *gt_path, uint64_t tot_npts, uint64_t batch_npts, uint64
   // expect: gt is more than top 100.
   uint32_t *data = nullptr;
   size_t nq, dim;
-  pipeann::load_bin<uint32_t>(gt_path, data, nq, dim);
+  diskann::load_bin<uint32_t>(gt_path, data, nq, dim);
   auto data_idx = [&](size_t x, size_t y) { return data[x * dim + y]; };
   LOG(INFO) << "Loaded " << nq << " points with dim " << dim << " from " << gt_path;
   LOG(INFO) << "Checking if gt is more than top " << target_topk << " for each query.";
@@ -54,7 +54,7 @@ void check_and_gen(char *gt_path, uint64_t tot_npts, uint64_t batch_npts, uint64
     if (success) {
       std::string target_path = std::string(target_dir) + "/gt_" + std::to_string(st) + ".bin";
       LOG(INFO) << "Writing to " << target_path;
-      pipeann::save_bin<uint32_t>(target_path.c_str(), cur_gt.data(), nq, target_topk);
+      diskann::save_bin<uint32_t>(target_path.c_str(), cur_gt.data(), nq, target_topk);
     }
   }
   LOG(INFO) << "Success rate: " << success_cnt << " / " << ((tot_npts - batch_npts) / step);

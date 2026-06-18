@@ -127,3 +127,9 @@ target_link_libraries(motivation ${PROJECT_NAME} jemalloc aio)
 
 add_executable(motivation_stress motivation_stress.cpp)
 target_link_libraries(motivation_stress ${PROJECT_NAME} jemalloc aio)
+
+add_executable(gen_tags gen_tags.cpp)
+target_link_libraries(gen_tags ${PROJECT_NAME} jemalloc aio)
+
+add_executable(gt_update gt_update.cpp)
+target_link_libraries(gt_update ${PROJECT_NAME} jemalloc aio)

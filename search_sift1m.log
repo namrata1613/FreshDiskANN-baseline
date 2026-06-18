@@ -1,0 +1,15 @@
+Attach  debugger and press a key
+Search parameters: #threads: 2,  beamwidth: 4
+Reading bin file /home/nams/research/data/sift1m/sift_query.bin at offset 0...Metadata: #pts = 10000, #dims = 128, aligned_dim = 128... Allocated 5120000bytes and copied data 
+ Stat(/home/nams/research/data/sift1m/sift_groundtruth.bin) returned: 0
+Reading truthset file /home/nams/research/data/sift1m/sift_groundtruth.bin...
+Metadata: #pts = 10000, #dims = 100...
+L2: Using AVX2 distance computation
+L2: Using AVX2 distance computation
+Disk-Index File Meta-data: # nodes per sector: 0, max node len (bytes): 0, max node degree: 4611545290042643095, npts: 375833056, dim: 3605523751 disk_nnodes: 0 disk_ndims: 140728384744808
+Tags offset: 0 PQ Pivots offset: 0 PQ Vectors offset: 0
+After single file index check, Tags offset: 0 PQ Pivots offset: 0 PQ Vectors offset: 0
+Reading bin file /home/nams/research/work/sift1m_idx/sift1m_pq_compressed.bin ...
+Metadata: #pts = 375824608, #dims = 25925...
+terminate called after throwing an instance of 'std::bad_alloc'
+  what():  std::bad_alloc
