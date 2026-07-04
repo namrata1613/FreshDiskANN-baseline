@@ -1,4 +1,7 @@
 #include "v2/merge_insert.h"
+#include <fstream>
+#include <cstdlib>
+#include <cstdint>
 
 #include "log.h"
 #include <index.h>
@@ -161,6 +164,34 @@ void sync_search_kernel(T* query, size_t query_num, size_t query_aligned_dim,
     // }
     recall = diskann::calculate_recall(query_num, gt_ids, gt_dists, gt_dim,
                                        query_result_tags, recall_at, recall_at);
+        {
+            const char* p3dir = std::getenv("P3_DUMP");
+            if (p3dir != nullptr) {
+                std::string fn =
+                    std::string(p3dir) + "/L_" +
+                    std::to_string((long long)L) + ".u32";
+
+                std::ofstream ofs(fn, std::ios::binary);
+
+                uint32_t nq = (uint32_t) query_num;
+                uint32_t kk = (uint32_t) recall_at;
+
+                ofs.write((char*)&nq, 4);
+                ofs.write((char*)&kk, 4);
+
+                ofs.write(
+                    (char*) query_result_tags,
+                    (size_t) query_num *
+                    (size_t) recall_at *
+                    sizeof(TagT));
+
+                ofs.close();
+
+                std::cout << "P3 dump written: "
+                          << fn << std::endl;
+            }
+        }
+
     delete[] gt_ids;
     gt_ids = nullptr;
   }
@@ -204,6 +235,11 @@ void merge_kernel(diskann::MergeInsert<T, TagT>& sync_index,
 template<typename T, typename TagT>
 void deletion_kernel(T* data_load, diskann::MergeInsert<T, TagT>& sync_index,
                      std::vector<TagT>& delete_vec, size_t aligned_dim) {
+  if (std::getenv("INSERTS_ONLY") != nullptr) {
+      std::cout << "INSERTS_ONLY mode: skipping deletion kernel" << std::endl;
+      return;
+  }
+
   diskann::Timer      timer;
   size_t              npts = delete_vec.size();
   std::vector<double> delete_latencies(npts, 0);
