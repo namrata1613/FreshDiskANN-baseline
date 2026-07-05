@@ -462,7 +462,9 @@ namespace diskann {
     construct_index_merger();
     merge();
     destruct_index_merger();
-    diskann::cout << "Merge time : " << timer.elapsed() / 1000 << " ms"
+    _last_merge_ms = (double) timer.elapsed() / 1000.0 ;
+    _num_merges++;
+    diskann::cout << "Merge time : " << _last_merge_ms << " ms"
                   << std::endl;
     // end timer
 

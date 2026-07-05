@@ -42,6 +42,68 @@ uint32_t Merge_Size = 0;
 int            begin_time = 0;
 diskann::Timer globalTimer;
 
+// ---- Phase-2 scaffolding (Ask 1): durable telemetry + inert ablation flags ----
+
+std::string g_cache_mode = "baseline";   // --cache-mode {baseline|filter_tenant}
+std::string g_sched_mode = "fifo";       // --sched-mode {fifo|priority}
+std::string g_telemetry_csv = "";        // env TELEMETRY_CSV=/path/run.csv
+
+int      g_ckpt_idx = 0;
+int      g_batch_idx = -1;
+uint64_t g_cumulative_inserts = 0;
+int      g_is_merge_boundary = 0;
+
+template<typename T, typename TagT>
+void emit_telemetry_row(
+    diskann::MergeInsert<T, TagT>& sync_index,
+    float recall,
+    float p99_ms,
+    float mean_ios,
+    bool cal_recall)
+{
+    if (g_telemetry_csv.empty())
+        return;
+
+    bool need_header = !file_exists(g_telemetry_csv);
+    std::ofstream ofs(g_telemetry_csv, std::ios::app);   // append: survives exit(0)
+
+    if (!ofs.is_open())
+        return;
+
+    if (need_header) {
+        ofs << "timestamp,ckpt_idx,batch_idx,cumulative_inserts,merge_size,"
+               "mem_points,deletion_set_total,merges_so_far,last_merge_ms,"
+               "recall_at_10,p99_latency_ms,disk_deleted_ids,mean_disk_ios,"
+               "cache_mode,sched_mode,io_engine,is_merge_boundary\n";
+    }
+
+    size_t deletion_total =
+        sync_index._deletion_set_0.size() +
+        sync_index._deletion_set_1.size();
+
+    size_t merges_so_far =
+        (size_t)g_ckpt_idx + sync_index._num_merges;
+
+    ofs << (long long)time(nullptr) << ","
+        << g_ckpt_idx << ","
+        << g_batch_idx << ","
+        << g_cumulative_inserts << ","
+        << sync_index._merge_th << ","
+        << sync_index._mem_points << ","
+        << deletion_total << ","
+        << merges_so_far << ","
+        << sync_index._last_merge_ms << ","
+        << (cal_recall ? recall : -1.0f) << ","
+        << p99_ms << ","
+        << 0 << ","   // disk_deleted_ids: 0 under INSERTS_ONLY (lives in StreamingMerger; deferred)
+        << mean_ios << ","
+        << g_cache_mode << ","
+        << g_sched_mode << ","
+        << "io_uring" << ","
+        << g_is_merge_boundary
+        << std::endl;   // std::endl flushes -> row is durable before any exit(0)
+}
+
 // acutually also shows disk size
 void ShowMemoryStatus() {
   int current_time = globalTimer.elapsed() / 1.0e6f - begin_time;
@@ -219,7 +281,8 @@ void sync_search_kernel(T* query, size_t query_num, size_t query_aligned_dim,
             << (float) latency_stats[(_u64) (0.999 * ((double) query_num))]
             << std::setw(12) << recall << std::setw(12) << mean_ios
             << std::endl;
-
+  float p99_ms = (query_num ==0 ) ? 0.0f : (float) latency_stats[(_u64) (0.99 * ((double) query_num))];
+  emit_telemetry_row(sync_index, recall, p99_ms, mean_ios, calRecall);
   delete[] query_result_dists;
   delete[] query_result_tags;
 }
@@ -441,12 +504,19 @@ void update(const std::string& data_bin, const unsigned L_disk,
   std::string currentFileName = GetTruthFileName(truthset_file, res);
   begin_time = globalTimer.elapsed() / 1.0e6f;
   ShowMemoryStatus();
+  g_ckpt_idx = ckpt;  // phase 2 telemetry
+  g_batch_idx = -1;  // pre-insert baseline / post merge snapshot
+  g_cumulative_inserts = res;  
+  g_is_merge_boundary = (ckpt != 0) ? 1 : 0;  // relaunched proc -> post merge recall row
   for (int i = 0; i < Lsearch.size(); ++i) {
     sync_search_kernel(query, query_num, query_aligned_dim, recall_at,
                        Lsearch[i], sync_index, currentFileName, false, true);
   }
 
+  g_is_merge_boundary = 0;  
+
   for (int i = ckpt_i; i < batch; i++) {
+    g_batch_idx = i;  // phase 2 telemetry
     std::cout << "Batch: " << i << " Total Batch : " << batch << std::endl;
     std::vector<unsigned> insert_vec;
     std::vector<unsigned> delete_vec;
@@ -497,6 +567,7 @@ void update(const std::string& data_bin, const unsigned L_disk,
               << std::endl;
 
     res += vecs_per_step;
+    g_cumulative_inserts = res;  // phase 2 telemetry
     currentFileName = GetTruthFileName(truthset_file, res);
     ShowMemoryStatus();
 
@@ -524,6 +595,9 @@ void update(const std::string& data_bin, const unsigned L_disk,
                            false);
       } while (merge_status != std::future_status::ready);
       ShowMemoryStatus();
+      g_is_merge_boundary = 1;  // phase 2 telemetry
+      emit_telemetry_row(sync_index, -1.0f, 0.0f, 0.0f, false);  // post merge snapshot
+      g_is_merge_boundary = 0;
       std::cout << "Merge finished for checkpoint " << ckpt;
       exit(0);  // wait for reboot.
     }
@@ -560,13 +634,56 @@ int main(int argc, char** argv) {
   Merge_Size = (unsigned) std::atoi(argv[arg_no++]);
   std::cerr << "Merge size: " << Merge_Size << std::endl;
 
-  std::vector<uint64_t> Lsearch;
-  for (int i = arg_no; i < argc; ++i) {
-    Lsearch.push_back(std::atoi(argv[i]));
-  }
-  for (auto& x : Lsearch) {
+std::vector<uint64_t> Lsearch;
+
+for (int i = arg_no; i < argc; ++i) {
+    std::string a = argv[i];
+
+    if (a == "--cache-mode" && i + 1 < argc) {
+        g_cache_mode = argv[++i];
+    } else if (a == "--sched-mode" && i + 1 < argc) {
+        g_sched_mode = argv[++i];
+    } else {
+        Lsearch.push_back(std::atoi(argv[i]));
+    }
+}
+
+for (auto &x : Lsearch) {
     std::cerr << "Lsearch: " << x << std::endl;
-  }
+}
+
+// phase2: resolve inert ablation flags + telemetry sink (no behavior change)
+if (g_cache_mode != "baseline" && g_cache_mode != "filter-tenant") {
+    std::cerr << "Unknown --cache-mode '" << g_cache_mode
+              << "', using baseline"
+              << std::endl;
+    g_cache_mode = "baseline";
+}
+
+if (g_sched_mode != "fifo" && g_sched_mode != "priority") {
+    std::cerr << "Unknown --sched-mode '" << g_sched_mode
+              << "', using fifo"
+              << std::endl;
+    g_sched_mode = "fifo";
+}
+
+if (g_cache_mode == "filter-tenant")
+    std::cout << "filter-tenant: not yet implemented (routing to baseline)"
+              << std::endl;
+
+if (g_sched_mode == "priority")
+    std::cout << "priority: not yet implemented (routing to fifo)"
+              << std::endl;
+
+if (const char *tcsv = std::getenv("TELEMETRY_CSV"))
+    g_telemetry_csv = tcsv;
+
+std::cout << "[phase2] cache_mode=" << g_cache_mode
+          << " sched_mode=" << g_sched_mode
+          << " telemetry_csv="
+          << (g_telemetry_csv.empty() ? std::string("<none>")
+                                      : g_telemetry_csv)
+          << " io_engine=io_uring" << std::endl;
 
   if (std::string(argv[1]) == std::string("int8")) {
     diskann::DistanceL2Int8 dist_cmp;
