@@ -99,13 +99,10 @@ namespace diskann {
 
     if (merge_npts != 0) {
       _merge_th = merge_npts;
-      _mem_index_0 = std::make_shared<diskann::Index<T, TagT>>(
-          this->_dist_metric, dim, _merge_th, 1, _single_file_index, 1);
-      _mem_index_1 = std::make_shared<diskann::Index<T, TagT>>(
-          this->_dist_metric, dim, _merge_th, 1, _single_file_index, 1);
-    } else {
-      _mem_index_0 = _mem_index_1 = nullptr;
-    }
+      PartitionKey k0{};
+      partition(_mem_index_0, k0);
+      partition(_mem_index_1, k0);
+    } 
 
     _single_file_index = single_file_index;
     this->_dist_metric = dist_metric;
@@ -197,7 +194,30 @@ namespace diskann {
     _merger = nullptr;
   }
 
-  template<typename T, typename TagT>
+  template <typename T, typename TagT>
+  std::shared_ptr<Index<T, TagT>> MergeInsert<T, TagT>::partition(
+      std::unordered_map<PartitionKey,
+                        std::shared_ptr<Index<T, TagT>>,
+                        PartitionKeyHash>& buf,
+      const PartitionKey& key) {
+
+      auto it = buf.find(key);
+
+      if (it != buf.end())
+          return it->second;
+
+      auto idx = std::make_shared<diskann::Index<T, TagT>>(
+          this->_dist_metric,
+          _dim,
+          2 * _merge_th,
+          1,
+          _single_file_index,
+          1);
+
+      buf[key] = idx;
+      return idx;
+  }
+  template <typename T, typename TagT>
   int MergeInsert<T, TagT>::insert(const T* point, const TagT& tag) {
     while (_check_switch_index.load()) {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -216,36 +236,48 @@ namespace diskann {
       return -1;
     }
 
+    const PartitionKey k0{};
+
     if (_active_index == 0) {
-      if (_mem_index_0->get_num_points() < _mem_index_0->return_max_points()) {
-        if (_mem_index_0->insert_point(point, _paras_mem, tag) != 0) {
-          diskann::cout << "Could not insert point with tag " << tag
-                        << std::endl;
-          return -3;
+        auto mem = partition(_mem_index_0, k0);
+
+        if (mem->get_num_points() < mem->return_max_points()) {
+            if (mem->insert_point(point, _paras_mem, tag) != 0) {
+                diskann::cout << "Could not insert point with tag " << tag << std::endl;
+                return -3;
+            }
+
+            {
+                std::unique_lock<std::shared_timed_mutex> lock(_change_lock);
+                _mem_points++;
+                _mem_points_by_key[k0]++;
+            }
+
+            return 0;
+        } else {
+            diskann::cout << "Capacity exceeded" << std::endl;
         }
-        {
-          std::unique_lock<std::shared_timed_mutex> lock(_change_lock);
-          _mem_points++;
-        }
-        return 0;
-      } else {
-        diskann::cout << "Capacity exceeded" << std::endl;
-      }
+
     } else {
-      if (_mem_index_1->get_num_points() < _mem_index_1->return_max_points()) {
-        if (_mem_index_1->insert_point(point, _paras_mem, tag) != 0) {
-          diskann::cout << "Could not insert point with tag " << tag
-                        << std::endl;
-          return -3;
+
+        auto mem = partition(_mem_index_1, k0);
+
+        if (mem->get_num_points() < mem->return_max_points()) {
+            if (mem->insert_point(point, _paras_mem, tag) != 0) {
+                diskann::cout << "Could not insert point with tag " << tag << std::endl;
+                return -3;
+            }
+
+            {
+                std::unique_lock<std::shared_timed_mutex> lock(_change_lock);
+                _mem_points++;
+                _mem_points_by_key[k0]++;
+            }
+
+            return 0;
+        } else {
+            diskann::cout << "Capacity exceeded in mem_index_1" << std::endl;
         }
-        {
-          std::unique_lock<std::shared_timed_mutex> lock(_change_lock);
-          _mem_points++;
-        }
-        return 0;
-      } else {
-        diskann::cout << "Capacity exceeded in mem_index 1" << std::endl;
-      }
     }
 
     return -2;
@@ -265,12 +297,14 @@ namespace diskann {
                     << std::endl;
     }
 
+    const PartitionKey k0{};
+
     if (_active_delete_set == 0) {
-      _deletion_set_0.insert(tag);
-      _mem_index_0->lazy_delete(tag);
+        _deletion_set_0[k0].insert(tag);
+        partition(_mem_index_0, k0)->lazy_delete(tag);
     } else {
-      _deletion_set_1.insert(tag);
-      _mem_index_1->lazy_delete(tag);
+        _deletion_set_1[k0].insert(tag);
+        partition(_mem_index_1, k0)->lazy_delete(tag);
     }
   }
 
@@ -279,6 +313,7 @@ namespace diskann {
                                          const uint64_t search_L, TagT* tags,
                                          float* distances, QueryStats* stats) {
     std::set<Neighbor_Tag<TagT>> best;
+    const PartitionKey k0{};
     // search disk index and get top K tags
     {
       std::shared_lock<std::shared_timed_mutex> lock(_disk_lock);
@@ -300,25 +335,37 @@ namespace diskann {
     // check each memory index - if non empty and not being currently cleared -
     // search and get top K active tags
     {
-      if (_clearing_index_0.load() == false) {
-        std::shared_lock<std::shared_timed_mutex> lock(_clear_lock_0);
-        if (_mem_index_0->get_num_points() > 0) {
-          std::vector<Neighbor_Tag<TagT>> best_mem_index_0;
-          _mem_index_0->search(query, (uint32_t) search_L, (uint32_t) search_L,
-                               best_mem_index_0);
-          for (auto iter : best_mem_index_0)
-            best.insert(iter);
-        }
-      }
+    if (_clearing_index_0.load() == false) {
+    std::shared_lock<std::shared_timed_mutex> lock(_clear_lock_0);
 
-      if (_clearing_index_1.load() == false) {
-        std::shared_lock<std::shared_timed_mutex> lock(_clear_lock_1);
-        if (_mem_index_1->get_num_points() > 0) {
-          std::vector<Neighbor_Tag<TagT>> best_mem_index_1;
-          _mem_index_1->search(query, (uint32_t) search_L, (uint32_t) search_L,
-                               best_mem_index_1);
-          for (auto iter : best_mem_index_1)
+    auto it0 = _mem_index_0.find(k0);
+    if (it0 != _mem_index_0.end() && it0->second->get_num_points() > 0) {
+        std::vector<Neighbor_Tag<TagT>> best_mem_index_0;
+
+        it0->second->search(query,
+                            (uint32_t)search_L,
+                            (uint32_t)search_L,
+                            best_mem_index_0);
+
+        for (auto iter : best_mem_index_0)
             best.insert(iter);
+      }
+    }
+
+    if (_clearing_index_1.load() == false) {
+        std::shared_lock<std::shared_timed_mutex> lock(_clear_lock_1);
+
+        auto it1 = _mem_index_1.find(k0);
+        if (it1 != _mem_index_1.end() && it1->second->get_num_points() > 0) {
+            std::vector<Neighbor_Tag<TagT>> best_mem_index_1;
+
+            it1->second->search(query,
+                                (uint32_t)search_L,
+                                (uint32_t)search_L,
+                                best_mem_index_1);
+
+            for (auto iter : best_mem_index_1)
+                best.insert(iter);
         }
       }
     }
@@ -332,15 +379,24 @@ namespace diskann {
     {
       std::shared_lock<std::shared_timed_mutex> lock(_delete_lock);
       size_t                                    pos = 0;
+      auto d0 = _deletion_set_0.find(k0);
+      auto d1 = _deletion_set_1.find(k0);
+
       for (auto iter : best_vec) {
-        if ((_deletion_set_0.find(iter.tag) == _deletion_set_0.end()) &&
-            (_deletion_set_1.find(iter.tag) == _deletion_set_1.end())) {
-          tags[pos] = iter.tag;
-          distances[pos] = iter.dist;
-          pos++;
-        }
-        if (pos == K)
-          break;
+          bool deleted =
+              (d0 != _deletion_set_0.end() &&
+              d0->second.find(iter.tag) != d0->second.end()) ||
+              (d1 != _deletion_set_1.end() &&
+              d1->second.find(iter.tag) != d1->second.end());
+
+          if (!deleted) {
+              tags[pos]      = iter.tag;
+              distances[pos] = iter.dist;
+              pos++;
+          }
+
+          if (pos == K)
+              break;
       }
     }
   }
@@ -358,14 +414,14 @@ namespace diskann {
   template<typename T, typename TagT>
   void MergeInsert<T, TagT>::final_merge() {
     diskann::cout << "Inside final_merge()." << std::endl;
-    diskann::cout << _mem_index_0->get_num_points() << "  "
-                  << _mem_index_1->get_num_points() << std::endl;
+    diskann::cout << partition(_mem_index_0,PartitionKey{})->get_num_points() << "  "
+                  << partition(_mem_index_1,PartitionKey{})->get_num_points() << std::endl;
     if (_mem_points > 0) {
       save_del_set();
       switch_index();
     }
-    diskann::cout << _mem_index_0->get_num_points() << "  "
-                  << _mem_index_1->get_num_points() << std::endl;
+    diskann::cout << partition(_mem_index_0,PartitionKey{})->get_num_points() << "  "
+                  << partition(_mem_index_1,PartitionKey{})->get_num_points() << std::endl;
   }
 
   template<typename T, typename TagT>
@@ -427,7 +483,7 @@ namespace diskann {
       std::unique_lock<std::shared_timed_mutex> lock(_index_lock);
       // make new index active
       if (_active_index == 0) {
-        _mem_index_1 = std::make_shared<diskann::Index<T, TagT>>(
+        _mem_index_1[PartitionKey{}] = std::make_shared<diskann::Index<T, TagT>>(
             this->_dist_metric, _dim, _merge_th * 2, 1, _single_file_index, 1);
         bool expected_active = false;
         if (_active_1.compare_exchange_strong(expected_active, true)) {
@@ -439,7 +495,7 @@ namespace diskann {
         }
 
       } else {
-        _mem_index_0 = std::make_shared<diskann::Index<T, TagT>>(
+        _mem_index_0[PartitionKey{}] = std::make_shared<diskann::Index<T, TagT>>(
             this->_dist_metric, _dim, _merge_th * 2, 1, _single_file_index, 1);
         bool expected_active = false;
         if (_active_0.compare_exchange_strong(expected_active, true)) {
@@ -452,6 +508,7 @@ namespace diskann {
       }
       _active_index = 1 - _active_index;
       _mem_points = 0;
+      _mem_points_by_key[PartitionKey{}] = 0;
       expected_value = true;
       _check_switch_index.compare_exchange_strong(expected_value, false);
     }
@@ -477,9 +534,7 @@ namespace diskann {
         _clearing_index_1.compare_exchange_strong(expected_clearing, true);
         {
           std::unique_lock<std::shared_timed_mutex> lock(_clear_lock_1);
-          _mem_index_1.reset();
-          _mem_index_1 = nullptr;
-          _mem_index_1 = std::make_shared<diskann::Index<T, TagT>>(
+          _mem_index_1[PartitionKey{}] = std::make_shared<diskann::Index<T, TagT>>(
               _dist_metric, _dim, _merge_th * 2, 1, _single_file_index, 1);
         }
         expected_clearing = true;
@@ -493,9 +548,7 @@ namespace diskann {
         _clearing_index_0.compare_exchange_strong(expected_clearing, true);
         std::unique_lock<std::shared_timed_mutex> lock(_clear_lock_0);
         {
-          _mem_index_0.reset();
-          _mem_index_0 = nullptr;
-          _mem_index_0 = std::make_shared<diskann::Index<T, TagT>>(
+          _mem_index_0[PartitionKey{}] = std::make_shared<diskann::Index<T, TagT>>(
               _dist_metric, _dim, _merge_th * 2, 1, _single_file_index, 1);
         }
         expected_clearing = true;
@@ -517,7 +570,7 @@ namespace diskann {
         diskann::cout << "Saving mem index 0 to merge it into disk index"
                       << std::endl;
         std::string save_path = _mem_index_prefix + "_0";
-        _mem_index_0->save(save_path.c_str());
+        (partition(_mem_index_0, PartitionKey{}))->save(save_path.c_str());
       } else {
         diskann::cout << "Index 0 is already inactive" << std::endl;
         return -1;
@@ -527,7 +580,7 @@ namespace diskann {
         diskann::cout << "Saving mem index 1 to merge it into disk index"
                       << std::endl;
         std::string save_path = _mem_index_prefix + "_1";
-        _mem_index_1->save(save_path.c_str());
+        (partition(_mem_index_1, PartitionKey{}))->save(save_path.c_str());
       } else {
         diskann::cout << "Index 1 is already inactive" << std::endl;
         return -1;
@@ -539,13 +592,14 @@ namespace diskann {
 
   template<typename T, typename TagT>
   void MergeInsert<T, TagT>::save_del_set() {
+    const PartitionKey k0{};
     {
       fprintf(stderr, "Inside save_del_set()\n");
       bool expected_value = false;
       _check_switch_delete.compare_exchange_strong(expected_value, true);
       std::unique_lock<std::shared_timed_mutex> lock(_delete_lock);
       if (_active_delete_set == 0) {
-        _deletion_set_1.clear();
+        _deletion_set_1[k0].clear();
         bool expected_active = false;
         if (_active_del_1.compare_exchange_strong(expected_active, true)) {
           diskann::cout
@@ -555,7 +609,7 @@ namespace diskann {
           diskann::cout << "Failed to clear _deletion_set_1" << std::endl;
         }
       } else {
-        _deletion_set_0.clear();
+        _deletion_set_0[k0].clear();
         bool expected_active = false;
         if (_active_del_0.compare_exchange_strong(expected_active, true)) {
           diskann::cout
@@ -577,10 +631,10 @@ namespace diskann {
 
     if (_active_delete_set == 0) {
       std::vector<TagT>* del_vec =
-          new std::vector<TagT>(_deletion_set_1.size());
+          new std::vector<TagT>(_deletion_set_1[k0].size());
 
       size_t i = 0;
-      for (auto iter : _deletion_set_1) {
+      for (auto iter : _deletion_set_1[k0]) {
         (*del_vec)[i] = iter;
         i++;
       }
@@ -593,10 +647,10 @@ namespace diskann {
       _deleted_tags_vector.push_back(del_vec);
     } else {
       std::vector<TagT>* del_vec =
-          new std::vector<TagT>(_deletion_set_0.size());
+          new std::vector<TagT>(_deletion_set_0[k0].size());
 
       size_t i = 0;
-      for (auto iter : _deletion_set_0) {
+      for (auto iter : _deletion_set_0[k0]) {
         (*del_vec)[i] = iter;
         i++;
       }

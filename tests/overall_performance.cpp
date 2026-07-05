@@ -77,9 +77,9 @@ void emit_telemetry_row(
                "cache_mode,sched_mode,io_engine,is_merge_boundary\n";
     }
 
-    size_t deletion_total =
-        sync_index._deletion_set_0.size() +
-        sync_index._deletion_set_1.size();
+    size_t deletion_total = 0;
+    for (auto &kv : sync_index._deletion_set_0) deletion_total += kv.second.size();
+    for (auto &kv : sync_index._deletion_set_1) deletion_total += kv.second.size();
 
     size_t merges_so_far =
         (size_t)g_ckpt_idx + sync_index._num_merges;

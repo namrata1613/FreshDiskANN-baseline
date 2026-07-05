@@ -8,6 +8,7 @@
 #include "pq_flash_index.h"
 #include "linux_aligned_file_reader.h"
 #include "index.h"
+#include "v2/partition_key.h"
 #include <algorithm>
 #include <atomic>
 #include <mutex>
@@ -46,17 +47,18 @@ namespace diskann {
     DISKANN_DLLEXPORT ~MergeInsert();
 
     DISKANN_DLLEXPORT void init_mem_index(uint64_t npts) {
-      if (_mem_index_0 != nullptr) {
-        std::cerr << "Index already initialized" << std::endl;
-        exit(-1);
-      } else {
+        if (!_mem_index_0.empty()) {
+            std::cerr << "Index already initialized" << std::endl;
+            exit(-1);
+        }
+
         std::cerr << "Init mem index with " << npts << " points" << std::endl;
+
         _merge_th = npts;
-        _mem_index_0 = std::make_shared<diskann::Index<T, TagT>>(
-            this->_dist_metric, _dim, 2 * _merge_th, 1, _single_file_index, 1);
-        _mem_index_1 = std::make_shared<diskann::Index<T, TagT>>(
-            this->_dist_metric, _dim, 2 * _merge_th, 1, _single_file_index, 1);
-      }
+
+        PartitionKey k0{};
+        partition(_mem_index_0, k0);
+        partition(_mem_index_1, k0);
     }
 
     // insertion function - insert into short_term_index
@@ -81,6 +83,14 @@ namespace diskann {
     DISKANN_DLLEXPORT std::string ret_merge_prefix();
 
    protected:
+
+    std::shared_ptr<Index<T, TagT>> partition(
+      std::unordered_map<PartitionKey,
+                        std::shared_ptr<Index<T, TagT>>,
+                        PartitionKeyHash>& buf,
+      const PartitionKey& key);
+
+
     // call constructor to StreamingMerger object
     void construct_index_merger();
 
@@ -115,8 +125,11 @@ namespace diskann {
 
     std::unordered_map<unsigned, TagT> curr_location_to_tag;
 
-    std::shared_ptr<Index<T, TagT>>    _mem_index_0 = nullptr;
-    std::shared_ptr<Index<T, TagT>>    _mem_index_1 = nullptr;
+    std::unordered_map<PartitionKey, std::shared_ptr<Index<T, TagT>>,
+                      PartitionKeyHash> _mem_index_0;
+
+    std::unordered_map<PartitionKey, std::shared_ptr<Index<T, TagT>>,
+                      PartitionKeyHash> _mem_index_1;
     std::shared_ptr<AlignedFileReader> reader = nullptr;
     PQFlashIndex<T, TagT>*             _disk_index = nullptr;
     StreamingMerger<T, TagT>*          _merger = nullptr;
@@ -128,8 +141,13 @@ namespace diskann {
     diskann::Parameters _paras_mem;
     diskann::Parameters _paras_disk;
 
-    tsl::robin_set<TagT> _deletion_set_0;
-    tsl::robin_set<TagT> _deletion_set_1;
+    std::unordered_map<PartitionKey, tsl::robin_set<TagT>,
+                      PartitionKeyHash> _deletion_set_0;
+
+    std::unordered_map<PartitionKey, tsl::robin_set<TagT>,
+                      PartitionKeyHash> _deletion_set_1;
+
+    std::unordered_map<PartitionKey, size_t, PartitionKeyHash> _mem_points_by_key;
 
     std::vector<const std::vector<TagT>*> _deleted_tags_vector;
 
