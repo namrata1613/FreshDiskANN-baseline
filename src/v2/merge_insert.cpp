@@ -194,17 +194,90 @@ namespace diskann {
     _merger = nullptr;
   }
 
-  template <typename T, typename TagT>
-  std::shared_ptr<Index<T, TagT>> MergeInsert<T, TagT>::partition(
+  template<typename T, typename TagT>
+  void MergeInsert<T, TagT>::set_synthetic_partitioning(uint32_t L_pred,
+                                                      uint32_t T_cnt) {
+
+    _L_pred = (L_pred == 0) ? 1u : L_pred;
+    _T_cnt  = (T_cnt == 0) ? 1u : T_cnt;
+
+    size_t est = (size_t)_L_pred * (size_t)_T_cnt;
+
+    // reserve so first-touch inserts don't rehash -> steady-state find() stays safe
+    _mem_index_0.reserve(est);
+    _mem_index_1.reserve(est);
+
+    _deletion_set_0.reserve(est);
+    _deletion_set_1.reserve(est);
+
+    _mem_points_by_key.reserve(est);
+
+    std::cout << "[C2] synthetic partitioning: label = id % " << _L_pred
+              << ", tenant = id % " << _T_cnt
+              << " (up to " << est << " partitions)" << std::endl;
+  }
+
+  template<typename T, typename TagT>
+  void MergeInsert<T, TagT>::load_metadata(const std::string& labels_file,
+                                          const std::string& tenants_file) {
+
+      _labels.clear();
+      _tenants.clear();
+
+      if (!labels_file.empty()) {
+          std::ifstream lf(labels_file);
+          std::string line;
+
+          while (std::getline(lf, line))
+              _labels.push_back(line.empty() ? 0u : (LabelId)std::stoul(line));
+      }
+
+      if (!tenants_file.empty()) {
+          std::ifstream tf(tenants_file);
+          std::string line;
+
+          while (std::getline(tf, line))
+              _tenants.push_back(line.empty() ? 0u : (TenantId)std::stoul(line));
+      }
+
+      std::cout << "[C2] loaded metadata: "
+                << _labels.size() << " labels, "
+                << _tenants.size() << " tenants" << std::endl;
+  }
+
+  template<typename T, typename TagT>
+  PartitionKey MergeInsert<T, TagT>::metadata_of(size_t id) const {
+
+      PartitionKey key;
+
+      if (!_labels.empty()) {
+          key.label  = (id < _labels.size()) ? _labels[id] : 0u;
+          key.tenant = (id < _tenants.size()) ? _tenants[id] : 0u;
+      } else {
+          key.label  = (LabelId)(id % _L_pred);
+          key.tenant = (TenantId)(id % _T_cnt);
+      }
+
+      return key;
+  }
+
+  template<typename T, typename TagT>
+  std::shared_ptr<Index<T, TagT>>
+  MergeInsert<T, TagT>::partition(
       std::unordered_map<PartitionKey,
                         std::shared_ptr<Index<T, TagT>>,
                         PartitionKeyHash>& buf,
       const PartitionKey& key) {
 
-      auto it = buf.find(key);
-
+      auto it = buf.find(key);      // steady state: existing key, lock-free
       if (it != buf.end())
           return it->second;
+
+      std::lock_guard<std::mutex> g(_partition_create_mtx);   // first-touch: atomic
+
+      auto itr = buf.find(key);      // re-check under the lock
+      if (itr != buf.end())
+          return itr->second;
 
       auto idx = std::make_shared<diskann::Index<T, TagT>>(
           this->_dist_metric,
@@ -217,6 +290,8 @@ namespace diskann {
       buf[key] = idx;
       return idx;
   }
+
+
   template <typename T, typename TagT>
   int MergeInsert<T, TagT>::insert(const T* point, const TagT& tag) {
     while (_check_switch_index.load()) {
@@ -236,10 +311,10 @@ namespace diskann {
       return -1;
     }
 
-    const PartitionKey k0{};
+    const PartitionKey key = metadata_of( (size_t) tag);
 
     if (_active_index == 0) {
-        auto mem = partition(_mem_index_0, k0);
+        auto mem = partition(_mem_index_0, key);
 
         if (mem->get_num_points() < mem->return_max_points()) {
             if (mem->insert_point(point, _paras_mem, tag) != 0) {
@@ -250,7 +325,7 @@ namespace diskann {
             {
                 std::unique_lock<std::shared_timed_mutex> lock(_change_lock);
                 _mem_points++;
-                _mem_points_by_key[k0]++;
+                _mem_points_by_key[key]++;
             }
 
             return 0;
@@ -260,7 +335,7 @@ namespace diskann {
 
     } else {
 
-        auto mem = partition(_mem_index_1, k0);
+        auto mem = partition(_mem_index_1, key);
 
         if (mem->get_num_points() < mem->return_max_points()) {
             if (mem->insert_point(point, _paras_mem, tag) != 0) {
@@ -271,7 +346,7 @@ namespace diskann {
             {
                 std::unique_lock<std::shared_timed_mutex> lock(_change_lock);
                 _mem_points++;
-                _mem_points_by_key[k0]++;
+                _mem_points_by_key[key]++;
             }
 
             return 0;
@@ -297,14 +372,14 @@ namespace diskann {
                     << std::endl;
     }
 
-    const PartitionKey k0{};
+    const PartitionKey key = metadata_of( (size_t) tag);
 
     if (_active_delete_set == 0) {
-        _deletion_set_0[k0].insert(tag);
-        partition(_mem_index_0, k0)->lazy_delete(tag);
+        _deletion_set_0[key].insert(tag);
+        partition(_mem_index_0, key)->lazy_delete(tag);
     } else {
-        _deletion_set_1[k0].insert(tag);
-        partition(_mem_index_1, k0)->lazy_delete(tag);
+        _deletion_set_1[key].insert(tag);
+        partition(_mem_index_1, key)->lazy_delete(tag);
     }
   }
 
@@ -413,6 +488,7 @@ namespace diskann {
 
   template<typename T, typename TagT>
   void MergeInsert<T, TagT>::final_merge() {
+    std::cerr << "[C2] partitions touched (_mem_points_by_key.size) = )"<<_mem_points_by_key.size() << std::endl;
     diskann::cout << "Inside final_merge()." << std::endl;
     diskann::cout << partition(_mem_index_0,PartitionKey{})->get_num_points() << "  "
                   << partition(_mem_index_1,PartitionKey{})->get_num_points() << std::endl;

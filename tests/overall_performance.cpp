@@ -490,6 +490,25 @@ void update(const std::string& data_bin, const unsigned L_disk,
     //     vecs_per_step;
   }
   sync_index.init_mem_index(Merge_Size);
+  // Phase-2 C2 (Agent 2): configure write-path partition routing
+  {
+      uint32_t c2_L = 1, c2_T = 1;
+
+      if (const char* e = std::getenv("C2_L_PRED"))
+          c2_L = (uint32_t) std::atoi(e);
+
+      if (const char* e = std::getenv("C2_T_CNT"))
+          c2_T = (uint32_t) std::atoi(e);
+
+      sync_index.set_synthetic_partitioning(c2_L, c2_T);
+
+      const char* lf = std::getenv("C2_LABELS_FILE");
+      const char* tf = std::getenv("C2_TENANTS_FILE");
+
+      if (lf || tf)
+          sync_index.load_metadata(lf ? lf : "", tf ? tf : "");
+  }
+  
   LOG(INFO) << "index npts: " << index_npts
             << " vecs per step: " << vecs_per_step << " ckpt_i: " << ckpt_i
             << " merge ratio: " << merge_ratio << " res: " << res;

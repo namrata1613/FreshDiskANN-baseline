@@ -61,6 +61,10 @@ namespace diskann {
         partition(_mem_index_1, k0);
     }
 
+    DISKANN_DLLEXPORT void set_synthetic_partitioning(uint32_t L_pred, uint32_t T_cnt);
+    DISKANN_DLLEXPORT void load_metadata(const std::string& labels_file, const std::string& tenants_file);
+    DISKANN_DLLEXPORT PartitionKey metadata_of(size_t vector_id) const;
+
     // insertion function - insert into short_term_index
     DISKANN_DLLEXPORT int insert(const T* point, const TagT& tag);
 
@@ -148,6 +152,11 @@ namespace diskann {
                       PartitionKeyHash> _deletion_set_1;
 
     std::unordered_map<PartitionKey, size_t, PartitionKeyHash> _mem_points_by_key;
+    std::vector<LabelId> _labels;
+    std::vector<TenantId> _tenants;
+    uint32_t _L_pred = 1;
+    uint32_t _T_cnt = 1;
+    std::mutex _partition_create_mtx;
 
     std::vector<const std::vector<TagT>*> _deleted_tags_vector;
 
