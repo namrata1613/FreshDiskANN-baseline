@@ -553,50 +553,60 @@ namespace diskann {
   }
 
   template<typename T, typename TagT>
-  void MergeInsert<T, TagT>::merge() {
-    std::vector<std::string> mem_in;
-    if (_active_index == 0)
-      mem_in.push_back(_mem_index_prefix + "_1");
-    else
-      mem_in.push_back(_mem_index_prefix + "_0");
+  void MergeInsert<T, TagT>::merge(const std::string& mem_file,
+                                  bool apply_deletes) {
+      std::vector<std::string> mem_in{mem_file};
+      std::vector<const std::vector<TagT>*> no_del;
 
-    _merger->merge(_disk_index_prefix_in.c_str(), mem_in,
-                   _disk_index_prefix_out.c_str(), _deleted_tags_vector,
-                   TMP_FOLDER);
+      _merger->merge(
+          _disk_index_prefix_in.c_str(),
+          mem_in,
+          _disk_index_prefix_out.c_str(),
+          apply_deletes ? _deleted_tags_vector : no_del,
+          TMP_FOLDER);
 
-    diskann::cout << "Merge done" << std::endl;
-    {
-      std::unique_lock<std::shared_timed_mutex> lock(_disk_lock);
-      bool                                      expected_value = false;
-      if (_switching_disk_prefixes.compare_exchange_strong(expected_value,
-                                                           true)) {
-        diskann::cout << "Switching to latest merged disk index " << std::endl;
-      } else {
-        diskann::cout << "Failed to switch" << std::endl;
-        //              return -1;
+      diskann::cout << "Merge done" << std::endl;
+
+      {
+          std::unique_lock<std::shared_timed_mutex> lock(_disk_lock);
+
+          bool expected_value = false;
+          if (_switching_disk_prefixes.compare_exchange_strong(expected_value,
+                                                              true)) {
+              diskann::cout << "Switching to latest merged disk index "
+                            << std::endl;
+          } else {
+              diskann::cout << "Failed to switch" << std::endl;
+          }
+
+          std::string temp = _disk_index_prefix_out;
+          _disk_index_prefix_out = _disk_index_prefix_in;
+          _disk_index_prefix_in = temp;
+
+          delete (_disk_index);
+
+          _disk_index = new diskann::PQFlashIndex<T, TagT>(
+              this->_dist_metric,
+              reader,
+              _single_file_index,
+              true);
+
+          int res =
+              _disk_index->load(_disk_index_prefix_in.c_str(),
+                                _num_search_threads);
+
+          if (res != 0) {
+              diskann::cout
+                  << "Failed to load new disk index after merge"
+                  << std::endl;
+              exit(-1);
+          }
+
+          expected_value = true;
+          _switching_disk_prefixes.compare_exchange_strong(expected_value,
+                                                          false);
       }
-
-      std::string temp = _disk_index_prefix_out;
-      _disk_index_prefix_out = _disk_index_prefix_in;
-      _disk_index_prefix_in = temp;
-      delete (_disk_index);
-      _disk_index = new diskann::PQFlashIndex<T, TagT>(
-          this->_dist_metric, reader, _single_file_index, true);
-
-      std::string pq_prefix = _disk_index_prefix_in + "_pq";
-      std::string disk_index_file = _disk_index_prefix_in + "_disk.index";
-      int         res =
-          _disk_index->load(_disk_index_prefix_in.c_str(), _num_search_threads);
-      if (res != 0) {
-        diskann::cout << "Failed to load new disk index after merge"
-                      << std::endl;
-        exit(-1);
-      }
-      expected_value = true;
-      _switching_disk_prefixes.compare_exchange_strong(expected_value, false);
-    }
   }
-
   template<typename T, typename TagT>
   void MergeInsert<T, TagT>::switch_index() {
     // unique lock throughout the function to ensure another thread does not
@@ -636,21 +646,33 @@ namespace diskann {
       }
       _active_index = 1 - _active_index;
       _mem_points = 0;
-      _mem_points_by_key[PartitionKey{}] = 0;
+      for (auto& kv : _mem_points_by_key) {
+        kv.second = 0;
+      }
       expected_value = true;
       _check_switch_index.compare_exchange_strong(expected_value, false);
     }
 
     save();
+
     // start timer
     diskann::Timer timer;
+
+    // single merge of the combined mem file (all partitions folded
+    // into one in save()) => baseline merge size/cadence => topology parity.
     construct_index_merger();
-    merge();
+
+    merge(_drain_files.empty()
+              ? (_mem_index_prefix + "_" + std::to_string(1 - _active_index))
+              : _drain_files[0],
+          true);
+
     destruct_index_merger();
-    _last_merge_ms = (double) timer.elapsed() / 1000.0 ;
+
+    _last_merge_ms = (double)timer.elapsed() / 1000.0;
     _num_merges++;
-    diskann::cout << "Merge time : " << _last_merge_ms << " ms"
-                  << std::endl;
+
+    diskann::cout << "Merge time : " << _last_merge_ms << " ms" << std::endl;
     // end timer
 
     {
@@ -662,8 +684,11 @@ namespace diskann {
         _clearing_index_1.compare_exchange_strong(expected_clearing, true);
         {
           std::unique_lock<std::shared_timed_mutex> lock(_clear_lock_1);
-          _mem_index_1[PartitionKey{}] = std::make_shared<diskann::Index<T, TagT>>(
+          for (auto& kv : _mem_index_1) {
+            kv.second = std::make_shared<diskann::Index<T, TagT>>(
               _dist_metric, _dim, _merge_th * 2, 1, _single_file_index, 1);
+          }
+
         }
         expected_clearing = true;
         assert(expected_clearing == true);
@@ -676,8 +701,11 @@ namespace diskann {
         _clearing_index_0.compare_exchange_strong(expected_clearing, true);
         std::unique_lock<std::shared_timed_mutex> lock(_clear_lock_0);
         {
-          _mem_index_0[PartitionKey{}] = std::make_shared<diskann::Index<T, TagT>>(
+          for (auto& kv : _mem_index_0) {
+            kv.second = std::make_shared<diskann::Index<T, TagT>>(
               _dist_metric, _dim, _merge_th * 2, 1, _single_file_index, 1);
+          }
+          
         }
         expected_clearing = true;
         assert(expected_clearing == true);
@@ -690,32 +718,66 @@ namespace diskann {
   }
 
   template<typename T, typename TagT>
-  int MergeInsert<T, TagT>::save() {
-    // only switch_index will call this function
-    bool expected_active = true;
-    if (_active_index == 1) {
-      if (_active_0.compare_exchange_strong(expected_active, false)) {
-        diskann::cout << "Saving mem index 0 to merge it into disk index"
-                      << std::endl;
-        std::string save_path = _mem_index_prefix + "_0";
-        (partition(_mem_index_0, PartitionKey{}))->save(save_path.c_str());
-      } else {
-        diskann::cout << "Index 0 is already inactive" << std::endl;
-        return -1;
+  int MergeInsert<T, TagT>::save() { // only switch_index will call this function
+      _drain_files.clear();
+
+      const auto merged_slot = (_active_index == 1) ? 0 : 1;
+      auto&       buf = (merged_slot == 0) ? _mem_index_0 : _mem_index_1;
+      std::atomic_bool& active_flag = (merged_slot == 0) ? _active_0 : _active_1;
+
+      bool expected_active = true;
+      if (!active_flag.compare_exchange_strong(expected_active, false)) {
+          diskann::cout << "Index " << merged_slot << " is already inactive" << std::endl;
+          return -1;
       }
-    } else {
-      if (_active_1.compare_exchange_strong(expected_active, false)) {
-        diskann::cout << "Saving mem index 1 to merge it into disk index"
-                      << std::endl;
-        std::string save_path = _mem_index_prefix + "_1";
-        (partition(_mem_index_1, PartitionKey{}))->save(save_path.c_str());
-      } else {
-        diskann::cout << "Index 1 is already inactive" << std::endl;
-        return -1;
+
+      const std::string save_path = _mem_index_prefix + "_" + std::to_string(merged_slot);
+
+      // fold ALL partitions of the merged slot into ONE combined mem
+      // index, then merge that single file. One merge/checkpoint == baseline
+      // cadence -> topology parity. Avoids the StreamingMerger N-file path
+      // (which corrupts/degrades the graph) AND the N-sequential-merge path
+      // (which shrinks effective merge size => recall decay).
+      size_t total_pts = 0;
+      for (auto& kv : buf)
+          total_pts += kv.second->get_num_points();
+
+      if (total_pts == 0) {
+          partition(buf, PartitionKey{})->save(save_path.c_str());
+          _drain_files.push_back(save_path);
+          diskann::cout << "Saved empty mem index " << merged_slot << std::endl;
+          return 0;
       }
-    }
-    diskann::cout << "Saved mem index" << std::endl;
-    return 0;
+
+      auto combined = std::make_shared<diskann::Index<T, TagT>>(
+          _dist_metric, _dim, 2 * _merge_th, 1, _single_file_index, 1);
+
+      size_t copied = 0;
+      for (auto& kv : buf) {
+          if (kv.second->get_num_points() == 0)
+              continue;
+
+          tsl::robin_set<TagT> tags;
+          kv.second->get_active_tags(tags);
+
+          for (const TagT& t : tags) {
+              const T* vec = kv.second->get_vector_by_tag(t);
+              if (vec == nullptr)
+                  continue;  // tag deleted between calls; skip
+
+              if (combined->insert_point(vec, _paras_mem, t) == 0)
+                  copied++;
+          }
+      }
+
+      combined->save(save_path.c_str());
+      _drain_files.push_back(save_path);
+
+      diskann::cout << "Saved combined mem index " << merged_slot << " ("
+                    << copied << " pts from " << buf.size() << " partitions)"
+                    << std::endl;
+
+      return 0;
   }
 
   template<typename T, typename TagT>

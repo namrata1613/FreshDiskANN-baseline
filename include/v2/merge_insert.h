@@ -115,7 +115,7 @@ namespace diskann {
 
     // call merge on a StreamingMerger object, only if index switching and
     // saving is successful
-    void merge();
+    void merge(const std::string& mem_file, bool apply_deletes);
 
    public:
     size_t   _merge_th = 0;
@@ -160,6 +160,7 @@ namespace diskann {
     std::mutex _partition_create_mtx;
 
     std::vector<const std::vector<TagT>*> _deleted_tags_vector;
+    std::vector<std::string> _drain_files;  // per partition mem files drained this merge
 
     int              _active_index = 0;  // reflects value of writable index
     int              _active_delete_set = 0;  // reflects active _deletion_set

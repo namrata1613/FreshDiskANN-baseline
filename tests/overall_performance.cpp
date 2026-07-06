@@ -92,7 +92,9 @@ void emit_telemetry_row(diskann::MergeInsert<T, TagT>& sync_index, float recall,
     ofs << "timestamp,ckpt_idx,batch_idx,cumulative_inserts,merge_size,"
            "mem_points,deletion_set_total,merges_so_far,last_merge_ms,"
            "recall_at_10,p99_latency_ms,disk_deleted_ids,mean_disk_ios,"
-           "cache_mode,sched_mode,io_engine,is_merge_boundary\n";
+           "cache_mode,sched_mode,io_engine,is_merge_boundary,"
+           "l_pred,t_cnt,n_partitions_active,n_partitions_merging,"
+           "mem_index_bytes,probed_partition_occupancy\n";
   }
 
   size_t deletion_total = 0;
@@ -103,6 +105,33 @@ void emit_telemetry_row(diskann::MergeInsert<T, TagT>& sync_index, float recall,
 
   size_t merges_so_far = (size_t) g_ckpt_idx + sync_index._num_merges;
 
+  // partition telemetry (all from public members; no library change)
+  auto& active_slot = (sync_index._active_index == 0) ? sync_index._mem_index_0
+                                                      : sync_index._mem_index_1;
+
+  auto& merging_slot = (sync_index._active_index == 0)
+                           ? sync_index._mem_index_1
+                           : sync_index._mem_index_0;
+
+  size_t n_partitions_active = active_slot.size();
+  size_t n_partitions_merging = merging_slot.size();
+  size_t total_partitions = n_partitions_active + n_partitions_merging;
+
+  // RSS proxy: each partition reallocates an Index sized 2*_merge_d (contract).
+  // This is the vector-data capacity term (the tunable knob); excludes
+  // graph/tag overhead, so it under-counts OS RSS but scales as #partitions x
+  // 2xMerge_Size.
+  size_t per_index_bytes =
+      (size_t) 2 * sync_index._merge_th * sync_index._dim * sizeof(T);
+
+  size_t mem_index_bytes = total_partitions * per_index_bytes;
+
+  // busiest probed partition = max per-key occupancy in the active slot
+  size_t probed_partition_occupancy = 0;
+  for (auto& kv : sync_index._mem_points_by_key)
+    if (kv.second > probed_partition_occupancy)
+      probed_partition_occupancy = kv.second;
+
   ofs << (long long) time(nullptr) << "," << g_ckpt_idx << "," << g_batch_idx
       << "," << g_cumulative_inserts << "," << sync_index._merge_th << ","
       << sync_index._mem_points << "," << deletion_total << "," << merges_so_far
@@ -112,8 +141,23 @@ void emit_telemetry_row(diskann::MergeInsert<T, TagT>& sync_index, float recall,
               // StreamingMerger; deferred)
       << mean_ios << "," << g_cache_mode << "," << g_sched_mode << ","
       << "io_uring"
-      << "," << g_is_merge_boundary
-      << std::endl;  // std::endl flushes -> row is durable before any exit(0)
+      << "," << g_is_merge_boundary << "," << sync_index._L_pred << ","
+      << sync_index._T_cnt << "," << n_partitions_active << ","
+      << n_partitions_merging << "," << mem_index_bytes << ","
+      << probed_partition_occupancy
+      << std::endl;  // std::endl flushes -> row durable before any exit(0)
+
+  long          vmhwm_kb = 0;
+  std::ifstream stfile("/proc/self/status");
+  std::string   sline;
+
+  while (std::getline(stfile, sline))
+    if (sline.rfind("VmHWM:", 0) == 0) {
+      sscanf(sline.c_str(), "VmHWM: %ld kB", &vmhwm_kb);
+      break;
+    }
+
+  std::cout << "peak RSS (VmHWM): " << vmhwm_kb << " KB" << std::endl;
 }
 
 // acutually also shows disk size
