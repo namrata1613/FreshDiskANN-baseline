@@ -385,95 +385,147 @@ namespace diskann {
 
   template<typename T, typename TagT>
   void MergeInsert<T, TagT>::search_sync(const T* query, const uint64_t K,
-                                         const uint64_t search_L, TagT* tags,
-                                         float* distances, QueryStats* stats) {
-    std::set<Neighbor_Tag<TagT>> best;
-    const PartitionKey k0{};
-    // search disk index and get top K tags
-    {
-      std::shared_lock<std::shared_timed_mutex> lock(_disk_lock);
-      assert(_switching_disk_prefixes == false);
-      std::vector<uint64_t> disk_result_ids_64(search_L);
-      std::vector<float>    disk_result_dists(search_L);
-      std::vector<TagT>     disk_result_tags(search_L);
-      _disk_index->cached_beam_search(
-          query, search_L, search_L, disk_result_tags.data(),
-          disk_result_dists.data(), _beamwidth, stats);
-      for (unsigned i = 0; i < disk_result_tags.size(); i++) {
-        Neighbor_Tag<TagT> n;
-        n = Neighbor_Tag<TagT>(disk_result_tags[i], disk_result_dists[i]);
-        //                    best.insert(Neighbor_Tag<TagT>(disk_result_tags[i],
-        //                    disk_result_dists[i]));
-        best.insert(n);
+                                        const uint64_t search_L, TagT* tags,
+                                        float* distances, QueryStats* stats,
+                                        PartitionKey query_key) {
+      std::set<Neighbor_Tag<TagT>> best;
+
+      // I1: single label => filtering is inert => exact baseline collapse.
+      const bool label_filter = (_L_pred > 1);
+
+      // Step 2: routing-correctness check (Release-safe, env-gated, cheap).
+      static const bool routing_check =
+          (std::getenv("C2_ROUTING_CHECK") != nullptr);
+      static const char* dpf = std::getenv("C2_DISK_POSTFILTER");
+      const bool disk_postfilter = (dpf == nullptr) || (std::atoi(dpf) != 0);
+
+      // 1.1 Disk search unchanged; post-filter candidates by label iff a
+      // predicate is meaningful (inert under the single-label anchor).
+      {
+          std::shared_lock<std::shared_timed_mutex> lock(_disk_lock);
+          assert(_switching_disk_prefixes == false);
+
+          std::vector<uint64_t> disk_result_ids_64(search_L);
+          std::vector<float> disk_result_dists(search_L);
+          std::vector<TagT> disk_result_tags(search_L);
+
+          _disk_index->cached_beam_search(
+              query, search_L, search_L,
+              disk_result_tags.data(),
+              disk_result_dists.data(),
+              _beamwidth, stats);
+
+          for (unsigned i = 0; i < disk_result_tags.size(); i++) {
+              if (label_filter && disk_postfilter &&
+                  metadata_of((size_t)disk_result_tags[i]).label != query_key.label)
+                  continue;
+
+              best.insert(
+                  Neighbor_Tag<TagT>(disk_result_tags[i],
+                                    disk_result_dists[i]));
+          }
       }
-    }
-    // check each memory index - if non empty and not being currently cleared -
-    // search and get top K active tags
-    {
-    if (_clearing_index_0.load() == false) {
-    std::shared_lock<std::shared_timed_mutex> lock(_clear_lock_0);
 
-    auto it0 = _mem_index_0.find(k0);
-    if (it0 != _mem_index_0.end() && it0->second->get_num_points() > 0) {
-        std::vector<Neighbor_Tag<TagT>> best_mem_index_0;
+      // 1.2 Cache probe: ONLY the query's partition, in both slots (skip if absent).
+      {
+          if (_clearing_index_0.load() == false) {
+              std::shared_lock<std::shared_timed_mutex> lock(_clear_lock_0);
 
-        it0->second->search(query,
-                            (uint32_t)search_L,
-                            (uint32_t)search_L,
-                            best_mem_index_0);
+              auto it0 = _mem_index_0.find(query_key);
+              if (it0 != _mem_index_0.end() &&
+                  it0->second->get_num_points() > 0) {
 
-        for (auto iter : best_mem_index_0)
-            best.insert(iter);
-      }
-    }
+                  std::vector<Neighbor_Tag<TagT>> best_mem_index_0;
 
-    if (_clearing_index_1.load() == false) {
-        std::shared_lock<std::shared_timed_mutex> lock(_clear_lock_1);
+                  it0->second->search(
+                      query,
+                      (uint32_t)search_L,
+                      (uint32_t)search_L,
+                      best_mem_index_0);
 
-        auto it1 = _mem_index_1.find(k0);
-        if (it1 != _mem_index_1.end() && it1->second->get_num_points() > 0) {
-            std::vector<Neighbor_Tag<TagT>> best_mem_index_1;
+                  for (auto iter : best_mem_index_0) {
+                      if (routing_check && label_filter &&
+                          metadata_of((size_t)iter.tag).label != query_key.label) {
+                          std::cerr
+                              << "[C2][FATAL] routing violation (slot0): cached id "
+                              << iter.tag << " label "
+                              << metadata_of((size_t)iter.tag).label
+                              << " != query label "
+                              << query_key.label << std::endl;
+                          std::abort();
+                      }
 
-            it1->second->search(query,
-                                (uint32_t)search_L,
-                                (uint32_t)search_L,
-                                best_mem_index_1);
-
-            for (auto iter : best_mem_index_1)
-                best.insert(iter);
-        }
-      }
-    }
-    std::vector<Neighbor_Tag<TagT>> best_vec;
-    for (auto iter : best)
-      best_vec.emplace_back(iter);
-    //        std::sort(best_vec.begin(), best_vec.end());
-    if (best_vec.size() > K)
-    //          best_vec.erase(best_vec.begin() + K, best_vec.end());
-    // aggregate results, sort and pick top K candidates
-    {
-      std::shared_lock<std::shared_timed_mutex> lock(_delete_lock);
-      size_t                                    pos = 0;
-      auto d0 = _deletion_set_0.find(k0);
-      auto d1 = _deletion_set_1.find(k0);
-
-      for (auto iter : best_vec) {
-          bool deleted =
-              (d0 != _deletion_set_0.end() &&
-              d0->second.find(iter.tag) != d0->second.end()) ||
-              (d1 != _deletion_set_1.end() &&
-              d1->second.find(iter.tag) != d1->second.end());
-
-          if (!deleted) {
-              tags[pos]      = iter.tag;
-              distances[pos] = iter.dist;
-              pos++;
+                      best.insert(iter);
+                  }
+              }
           }
 
-          if (pos == K)
-              break;
+          if (_clearing_index_1.load() == false) {
+              std::shared_lock<std::shared_timed_mutex> lock(_clear_lock_1);
+
+              auto it1 = _mem_index_1.find(query_key);
+              if (it1 != _mem_index_1.end() &&
+                  it1->second->get_num_points() > 0) {
+
+                  std::vector<Neighbor_Tag<TagT>> best_mem_index_1;
+
+                  it1->second->search(
+                      query,
+                      (uint32_t)search_L,
+                      (uint32_t)search_L,
+                      best_mem_index_1);
+
+                  for (auto iter : best_mem_index_1) {
+                      if (routing_check && label_filter &&
+                          metadata_of((size_t)iter.tag).label != query_key.label) {
+                          std::cerr
+                              << "[C2][FATAL] routing violation (slot1): cached id "
+                              << iter.tag << " label "
+                              << metadata_of((size_t)iter.tag).label
+                              << " != query label "
+                              << query_key.label << std::endl;
+                          std::abort();
+                      }
+
+                      best.insert(iter);
+                  }
+              }
+          }
       }
-    }
+
+      std::vector<Neighbor_Tag<TagT>> best_vec;
+      for (auto iter : best)
+          best_vec.emplace_back(iter);
+
+      if (best_vec.size() > K)
+          best_vec.resize(K);
+
+      // 1.3 Tombstone filter re-keyed from {0,0} to query_key; union + top-K.
+      {
+          std::shared_lock<std::shared_timed_mutex> lock(_delete_lock);
+
+          size_t pos = 0;
+
+          auto d0 = _deletion_set_0.find(query_key);
+          auto d1 = _deletion_set_1.find(query_key);
+
+          for (auto iter : best_vec) {
+              bool deleted =
+                  (d0 != _deletion_set_0.end() &&
+                  d0->second.find(iter.tag) != d0->second.end()) ||
+                  (d1 != _deletion_set_1.end() &&
+                  d1->second.find(iter.tag) != d1->second.end());
+
+              if (!deleted) {
+                  tags[pos] = iter.tag;
+                  distances[pos] = iter.dist;
+                  pos++;
+              }
+
+              if (pos == K)
+                  break;
+          }
+      }
   }
 
   template<typename T, typename TagT>

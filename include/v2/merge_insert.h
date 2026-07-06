@@ -75,7 +75,8 @@ namespace diskann {
     // return with top L candidate tags of the shard
     DISKANN_DLLEXPORT void search_sync(const T* query, const uint64_t K,
                                        const uint64_t search_L, TagT* tags,
-                                       float* distances, QueryStats* stats);
+                                       float* distances, QueryStats* stats,
+                                      PartitionKey query_key = PartitionKey{});
     // void return_active_tags(tsl::robin_set<TagT>& active_tags);
 
     // continuously runs in background to check if mem index size has exceeded

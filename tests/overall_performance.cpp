@@ -42,11 +42,33 @@ uint32_t Merge_Size = 0;
 int            begin_time = 0;
 diskann::Timer globalTimer;
 
-// ---- Phase-2 scaffolding (Ask 1): durable telemetry + inert ablation flags ----
+// ---- Phase-2 scaffolding (Ask 1): durable telemetry + inert ablation flags
+// ----
 
-std::string g_cache_mode = "baseline";   // --cache-mode {baseline|filter_tenant}
-std::string g_sched_mode = "fifo";       // --sched-mode {fifo|priority}
-std::string g_telemetry_csv = "";        // env TELEMETRY_CSV=/path/run.csv
+std::string g_cache_mode = "baseline";  // --cache-mode {baseline|filter_tenant}
+std::string g_sched_mode = "fifo";      // --sched-mode {fifo|priority}
+std::string g_telemetry_csv = "";       // env TELEMETRY_CSV=/path/run.csv
+
+// query-side partition key source (mirrors insert side)
+
+uint32_t                       g_c2_L_pred = 1;
+uint32_t                       g_c2_T_cnt = 1;
+std::vector<diskann::LabelId>  g_query_labels;
+std::vector<diskann::TenantId> g_query_tenants;
+
+static diskann::PartitionKey c2_query_key(size_t q) {
+  diskann::PartitionKey key{};
+
+  if (!g_query_labels.empty()) {
+    key.label = (q < g_query_labels.size()) ? g_query_labels[q] : 0u;
+    key.tenant = (q < g_query_tenants.size()) ? g_query_tenants[q] : 0u;
+  } else {
+    key.label = (diskann::LabelId)(q % g_c2_L_pred);
+    key.tenant = (diskann::TenantId)(q % g_c2_T_cnt);
+  }
+
+  return key;
+}
 
 int      g_ckpt_idx = 0;
 int      g_batch_idx = -1;
@@ -54,54 +76,44 @@ uint64_t g_cumulative_inserts = 0;
 int      g_is_merge_boundary = 0;
 
 template<typename T, typename TagT>
-void emit_telemetry_row(
-    diskann::MergeInsert<T, TagT>& sync_index,
-    float recall,
-    float p99_ms,
-    float mean_ios,
-    bool cal_recall)
-{
-    if (g_telemetry_csv.empty())
-        return;
+void emit_telemetry_row(diskann::MergeInsert<T, TagT>& sync_index, float recall,
+                        float p99_ms, float mean_ios, bool cal_recall) {
+  if (g_telemetry_csv.empty())
+    return;
 
-    bool need_header = !file_exists(g_telemetry_csv);
-    std::ofstream ofs(g_telemetry_csv, std::ios::app);   // append: survives exit(0)
+  bool          need_header = !file_exists(g_telemetry_csv);
+  std::ofstream ofs(g_telemetry_csv,
+                    std::ios::app);  // append: survives exit(0)
 
-    if (!ofs.is_open())
-        return;
+  if (!ofs.is_open())
+    return;
 
-    if (need_header) {
-        ofs << "timestamp,ckpt_idx,batch_idx,cumulative_inserts,merge_size,"
-               "mem_points,deletion_set_total,merges_so_far,last_merge_ms,"
-               "recall_at_10,p99_latency_ms,disk_deleted_ids,mean_disk_ios,"
-               "cache_mode,sched_mode,io_engine,is_merge_boundary\n";
-    }
+  if (need_header) {
+    ofs << "timestamp,ckpt_idx,batch_idx,cumulative_inserts,merge_size,"
+           "mem_points,deletion_set_total,merges_so_far,last_merge_ms,"
+           "recall_at_10,p99_latency_ms,disk_deleted_ids,mean_disk_ios,"
+           "cache_mode,sched_mode,io_engine,is_merge_boundary\n";
+  }
 
-    size_t deletion_total = 0;
-    for (auto &kv : sync_index._deletion_set_0) deletion_total += kv.second.size();
-    for (auto &kv : sync_index._deletion_set_1) deletion_total += kv.second.size();
+  size_t deletion_total = 0;
+  for (auto& kv : sync_index._deletion_set_0)
+    deletion_total += kv.second.size();
+  for (auto& kv : sync_index._deletion_set_1)
+    deletion_total += kv.second.size();
 
-    size_t merges_so_far =
-        (size_t)g_ckpt_idx + sync_index._num_merges;
+  size_t merges_so_far = (size_t) g_ckpt_idx + sync_index._num_merges;
 
-    ofs << (long long)time(nullptr) << ","
-        << g_ckpt_idx << ","
-        << g_batch_idx << ","
-        << g_cumulative_inserts << ","
-        << sync_index._merge_th << ","
-        << sync_index._mem_points << ","
-        << deletion_total << ","
-        << merges_so_far << ","
-        << sync_index._last_merge_ms << ","
-        << (cal_recall ? recall : -1.0f) << ","
-        << p99_ms << ","
-        << 0 << ","   // disk_deleted_ids: 0 under INSERTS_ONLY (lives in StreamingMerger; deferred)
-        << mean_ios << ","
-        << g_cache_mode << ","
-        << g_sched_mode << ","
-        << "io_uring" << ","
-        << g_is_merge_boundary
-        << std::endl;   // std::endl flushes -> row is durable before any exit(0)
+  ofs << (long long) time(nullptr) << "," << g_ckpt_idx << "," << g_batch_idx
+      << "," << g_cumulative_inserts << "," << sync_index._merge_th << ","
+      << sync_index._mem_points << "," << deletion_total << "," << merges_so_far
+      << "," << sync_index._last_merge_ms << ","
+      << (cal_recall ? recall : -1.0f) << "," << p99_ms << "," << 0
+      << ","  // disk_deleted_ids: 0 under INSERTS_ONLY (lives in
+              // StreamingMerger; deferred)
+      << mean_ios << "," << g_cache_mode << "," << g_sched_mode << ","
+      << "io_uring"
+      << "," << g_is_merge_boundary
+      << std::endl;  // std::endl flushes -> row is durable before any exit(0)
 }
 
 // acutually also shows disk size
@@ -204,9 +216,13 @@ void sync_search_kernel(T* query, size_t query_num, size_t query_aligned_dim,
   for (int64_t i = 0; i < (int64_t) query_num; i++) {
     auto qs = std::chrono::high_resolution_clock::now();
     // stats[i].n_current_used = 8;
+    diskann::PartitionKey qk = (g_cache_mode == "filter-tenant")
+                                   ? c2_query_key((size_t) i)
+                                   : diskann::PartitionKey{};
+
     sync_index.search_sync(query + i * query_aligned_dim, recall_at, L,
                            query_result_tags + i * recall_at,
-                           query_result_dists + i * recall_at, stats + i);
+                           query_result_dists + i * recall_at, stats + i, qk);
 
     auto qe = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> diff = qe - qs;
@@ -226,33 +242,28 @@ void sync_search_kernel(T* query, size_t query_num, size_t query_aligned_dim,
     // }
     recall = diskann::calculate_recall(query_num, gt_ids, gt_dists, gt_dim,
                                        query_result_tags, recall_at, recall_at);
-        {
-            const char* p3dir = std::getenv("P3_DUMP");
-            if (p3dir != nullptr) {
-                std::string fn =
-                    std::string(p3dir) + "/L_" +
-                    std::to_string((long long)L) + ".u32";
+    {
+      const char* p3dir = std::getenv("P3_DUMP");
+      if (p3dir != nullptr) {
+        std::string fn =
+            std::string(p3dir) + "/L_" + std::to_string((long long) L) + ".u32";
 
-                std::ofstream ofs(fn, std::ios::binary);
+        std::ofstream ofs(fn, std::ios::binary);
 
-                uint32_t nq = (uint32_t) query_num;
-                uint32_t kk = (uint32_t) recall_at;
+        uint32_t nq = (uint32_t) query_num;
+        uint32_t kk = (uint32_t) recall_at;
 
-                ofs.write((char*)&nq, 4);
-                ofs.write((char*)&kk, 4);
+        ofs.write((char*) &nq, 4);
+        ofs.write((char*) &kk, 4);
 
-                ofs.write(
-                    (char*) query_result_tags,
-                    (size_t) query_num *
-                    (size_t) recall_at *
-                    sizeof(TagT));
+        ofs.write((char*) query_result_tags,
+                  (size_t) query_num * (size_t) recall_at * sizeof(TagT));
 
-                ofs.close();
+        ofs.close();
 
-                std::cout << "P3 dump written: "
-                          << fn << std::endl;
-            }
-        }
+        std::cout << "P3 dump written: " << fn << std::endl;
+      }
+    }
 
     delete[] gt_ids;
     gt_ids = nullptr;
@@ -281,7 +292,10 @@ void sync_search_kernel(T* query, size_t query_num, size_t query_aligned_dim,
             << (float) latency_stats[(_u64) (0.999 * ((double) query_num))]
             << std::setw(12) << recall << std::setw(12) << mean_ios
             << std::endl;
-  float p99_ms = (query_num ==0 ) ? 0.0f : (float) latency_stats[(_u64) (0.99 * ((double) query_num))];
+  float p99_ms =
+      (query_num == 0)
+          ? 0.0f
+          : (float) latency_stats[(_u64) (0.99 * ((double) query_num))];
   emit_telemetry_row(sync_index, recall, p99_ms, mean_ios, calRecall);
   delete[] query_result_dists;
   delete[] query_result_tags;
@@ -299,8 +313,8 @@ template<typename T, typename TagT>
 void deletion_kernel(T* data_load, diskann::MergeInsert<T, TagT>& sync_index,
                      std::vector<TagT>& delete_vec, size_t aligned_dim) {
   if (std::getenv("INSERTS_ONLY") != nullptr) {
-      std::cout << "INSERTS_ONLY mode: skipping deletion kernel" << std::endl;
-      return;
+    std::cout << "INSERTS_ONLY mode: skipping deletion kernel" << std::endl;
+    return;
   }
 
   diskann::Timer      timer;
@@ -490,25 +504,56 @@ void update(const std::string& data_bin, const unsigned L_disk,
     //     vecs_per_step;
   }
   sync_index.init_mem_index(Merge_Size);
-  // Phase-2 C2 (Agent 2): configure write-path partition routing
+  // configure write-path partition routing
   {
-      uint32_t c2_L = 1, c2_T = 1;
+    uint32_t c2_L = 1, c2_T = 1;
 
-      if (const char* e = std::getenv("C2_L_PRED"))
-          c2_L = (uint32_t) std::atoi(e);
+    if (const char* e = std::getenv("C2_L_PRED"))
+      c2_L = (uint32_t) std::atoi(e);
 
-      if (const char* e = std::getenv("C2_T_CNT"))
-          c2_T = (uint32_t) std::atoi(e);
+    if (const char* e = std::getenv("C2_T_CNT"))
+      c2_T = (uint32_t) std::atoi(e);
 
-      sync_index.set_synthetic_partitioning(c2_L, c2_T);
+    sync_index.set_synthetic_partitioning(c2_L, c2_T);
 
-      const char* lf = std::getenv("C2_LABELS_FILE");
-      const char* tf = std::getenv("C2_TENANTS_FILE");
+    const char* lf = std::getenv("C2_LABELS_FILE");
+    const char* tf = std::getenv("C2_TENANTS_FILE");
 
-      if (lf || tf)
-          sync_index.load_metadata(lf ? lf : "", tf ? tf : "");
+    if (lf || tf)
+      sync_index.load_metadata(lf ? lf : "", tf ? tf : "");
+
+    // query-side key source (mirror of the insert side)
+    g_c2_L_pred = c2_L;
+    g_c2_T_cnt = c2_T;
+
+    if (const char* qlf = std::getenv("C2_QUERY_LABELS_FILE")) {
+      std::ifstream f(qlf);
+      std::string   line;
+      while (std::getline(f, line))
+        g_query_labels.push_back(
+            line.empty() ? 0u : (diskann::LabelId) std::stoul(line));
+    }
+
+    if (const char* qtf = std::getenv("C2_QUERY_TENANTS_FILE")) {
+      std::ifstream f(qtf);
+      std::string   line;
+      while (std::getline(f, line))
+        g_query_tenants.push_back(
+            line.empty() ? 0u : (diskann::TenantId) std::stoul(line));
+    }
+
+    if (g_cache_mode == "filter-tenant") {
+      if (!g_query_labels.empty())
+        std::cout << "[C2] query key source: sidecar (" << g_query_labels.size()
+                  << " labels, " << g_query_tenants.size() << " tenants)"
+                  << std::endl;
+      else
+        std::cout << "[C2] query key source: synthetic label = q % "
+                  << g_c2_L_pred << ", tenant = q % " << g_c2_T_cnt
+                  << std::endl;
+    }
   }
-  
+
   LOG(INFO) << "index npts: " << index_npts
             << " vecs per step: " << vecs_per_step << " ckpt_i: " << ckpt_i
             << " merge ratio: " << merge_ratio << " res: " << res;
@@ -524,15 +569,16 @@ void update(const std::string& data_bin, const unsigned L_disk,
   begin_time = globalTimer.elapsed() / 1.0e6f;
   ShowMemoryStatus();
   g_ckpt_idx = ckpt;  // phase 2 telemetry
-  g_batch_idx = -1;  // pre-insert baseline / post merge snapshot
-  g_cumulative_inserts = res;  
-  g_is_merge_boundary = (ckpt != 0) ? 1 : 0;  // relaunched proc -> post merge recall row
+  g_batch_idx = -1;   // pre-insert baseline / post merge snapshot
+  g_cumulative_inserts = res;
+  g_is_merge_boundary =
+      (ckpt != 0) ? 1 : 0;  // relaunched proc -> post merge recall row
   for (int i = 0; i < Lsearch.size(); ++i) {
     sync_search_kernel(query, query_num, query_aligned_dim, recall_at,
                        Lsearch[i], sync_index, currentFileName, false, true);
   }
 
-  g_is_merge_boundary = 0;  
+  g_is_merge_boundary = 0;
 
   for (int i = ckpt_i; i < batch; i++) {
     g_batch_idx = i;  // phase 2 telemetry
@@ -615,7 +661,8 @@ void update(const std::string& data_bin, const unsigned L_disk,
       } while (merge_status != std::future_status::ready);
       ShowMemoryStatus();
       g_is_merge_boundary = 1;  // phase 2 telemetry
-      emit_telemetry_row(sync_index, -1.0f, 0.0f, 0.0f, false);  // post merge snapshot
+      emit_telemetry_row(sync_index, -1.0f, 0.0f, 0.0f,
+                         false);  // post merge snapshot
       g_is_merge_boundary = 0;
       std::cout << "Merge finished for checkpoint " << ckpt;
       exit(0);  // wait for reboot.
@@ -653,56 +700,51 @@ int main(int argc, char** argv) {
   Merge_Size = (unsigned) std::atoi(argv[arg_no++]);
   std::cerr << "Merge size: " << Merge_Size << std::endl;
 
-std::vector<uint64_t> Lsearch;
+  std::vector<uint64_t> Lsearch;
 
-for (int i = arg_no; i < argc; ++i) {
+  for (int i = arg_no; i < argc; ++i) {
     std::string a = argv[i];
 
     if (a == "--cache-mode" && i + 1 < argc) {
-        g_cache_mode = argv[++i];
+      g_cache_mode = argv[++i];
     } else if (a == "--sched-mode" && i + 1 < argc) {
-        g_sched_mode = argv[++i];
+      g_sched_mode = argv[++i];
     } else {
-        Lsearch.push_back(std::atoi(argv[i]));
+      Lsearch.push_back(std::atoi(argv[i]));
     }
-}
+  }
 
-for (auto &x : Lsearch) {
+  for (auto& x : Lsearch) {
     std::cerr << "Lsearch: " << x << std::endl;
-}
+  }
 
-// phase2: resolve inert ablation flags + telemetry sink (no behavior change)
-if (g_cache_mode != "baseline" && g_cache_mode != "filter-tenant") {
-    std::cerr << "Unknown --cache-mode '" << g_cache_mode
-              << "', using baseline"
+  // phase2: resolve inert ablation flags + telemetry sink (no behavior change)
+  if (g_cache_mode != "baseline" && g_cache_mode != "filter-tenant") {
+    std::cerr << "Unknown --cache-mode '" << g_cache_mode << "', using baseline"
               << std::endl;
     g_cache_mode = "baseline";
-}
+  }
 
-if (g_sched_mode != "fifo" && g_sched_mode != "priority") {
-    std::cerr << "Unknown --sched-mode '" << g_sched_mode
-              << "', using fifo"
+  if (g_sched_mode != "fifo" && g_sched_mode != "priority") {
+    std::cerr << "Unknown --sched-mode '" << g_sched_mode << "', using fifo"
               << std::endl;
     g_sched_mode = "fifo";
-}
+  }
 
-if (g_cache_mode == "filter-tenant")
-    std::cout << "filter-tenant: not yet implemented (routing to baseline)"
-              << std::endl;
+  if (g_cache_mode == "filter-tenant")
+    std::cout << "filter-tenant: query-path routing active" << std::endl;
 
-if (g_sched_mode == "priority")
-    std::cout << "priority: not yet implemented (routing to fifo)"
-              << std::endl;
+  if (g_sched_mode == "priority")
+    std::cout << "priority: not yet implemented (routing to fifo)" << std::endl;
 
-if (const char *tcsv = std::getenv("TELEMETRY_CSV"))
+  if (const char* tcsv = std::getenv("TELEMETRY_CSV"))
     g_telemetry_csv = tcsv;
 
-std::cout << "[phase2] cache_mode=" << g_cache_mode
-          << " sched_mode=" << g_sched_mode
-          << " telemetry_csv="
-          << (g_telemetry_csv.empty() ? std::string("<none>")
-                                      : g_telemetry_csv)
-          << " io_engine=io_uring" << std::endl;
+  std::cout << "[phase2] cache_mode=" << g_cache_mode
+            << " sched_mode=" << g_sched_mode << " telemetry_csv="
+            << (g_telemetry_csv.empty() ? std::string("<none>")
+                                        : g_telemetry_csv)
+            << " io_engine=io_uring" << std::endl;
 
   if (std::string(argv[1]) == std::string("int8")) {
     diskann::DistanceL2Int8 dist_cmp;
