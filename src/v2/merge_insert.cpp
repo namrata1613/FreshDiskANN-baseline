@@ -566,6 +566,129 @@ namespace diskann {
   }
 
   template<typename T, typename TagT>
+  void MergeInsert<T, TagT>::save_deferred_staging(const std::string& prefix) {
+      if (_last_deferred.empty())
+          return;  // nothing deferred -> write nothing (anchor path untouched)
+
+      // Deferred partitions live in the merged (now-inactive) slot; 3a left
+      // them intact.
+      auto& merged = (_active_index == 0) ? _mem_index_1 : _mem_index_0;
+
+      std::ofstream man(prefix + "_manifest.txt", std::ios::trunc);
+
+      for (const auto& key : _last_deferred) {
+          auto it = merged.find(key);
+          if (it == merged.end() || it->second->get_num_points() == 0)
+              continue;
+
+          auto idx = it->second;
+
+          tsl::robin_set<TagT> tags;
+          idx->get_active_tags(tags);
+
+          const std::string pfile = prefix + "_"
+                                  + std::to_string(key.label)
+                                  + "_"
+                                  + std::to_string(key.tenant)
+                                  + ".pts";
+
+          std::ofstream ofs(pfile, std::ios::binary | std::ios::trunc);
+
+          uint32_t npts = 0, dim = (uint32_t)_dim;
+          ofs.write((char*)&npts, sizeof(uint32_t));  // backfilled below
+          ofs.write((char*)&dim, sizeof(uint32_t));
+
+          for (const TagT& t : tags) {
+              const T* vec = idx->get_vector_by_tag(t);
+              if (vec == nullptr)
+                  continue;
+
+              ofs.write((char*)&t, sizeof(TagT));
+              ofs.write((char*)vec, sizeof(T) * _dim);
+              npts++;
+          }
+
+          ofs.seekp(0);
+          ofs.write((char*)&npts, sizeof(uint32_t));  // real count
+          ofs.close();
+
+          man << key.label << " " << key.tenant << " " << npts << "\n";
+
+          std::cerr << "[C3-3b] saved deferred partition ("
+                    << key.label << ","
+                    << key.tenant << ") "
+                    << npts << " pts -> " << pfile
+                    << std::endl;
+      }
+
+      man.close();
+  }
+
+  template<typename T, typename TagT>
+  void MergeInsert<T, TagT>::load_deferred_staging(const std::string& prefix) {
+      const std::string manpath = prefix + "_manifest.txt";
+      std::ifstream man(manpath);
+      if (!man.is_open())
+          return;  // first ckpt / nothing deferred previously
+
+      // Reload into the ACTIVE slot (where new inserts land) so deferred points
+      // are searchable AND folded at the next merge.
+      auto& active_buf = (_active_index == 0) ? _mem_index_0 : _mem_index_1;
+
+      uint32_t label, tenant, npts_expected;
+      size_t total_reloaded = 0;
+
+      while (man >> label >> tenant >> npts_expected) {
+          PartitionKey key{label, tenant};
+
+          const std::string pfile = prefix + "_"
+                                  + std::to_string(label) + "_"
+                                  + std::to_string(tenant) + ".pts";
+
+          std::ifstream ifs(pfile, std::ios::binary);
+          if (!ifs.is_open())
+              continue;
+
+          uint32_t npts = 0, dim = 0;
+          ifs.read((char*)&npts, sizeof(uint32_t));
+          ifs.read((char*)&dim, sizeof(uint32_t));
+
+          auto idx = partition(active_buf, key);  // fresh Index
+          std::vector<T> vec(dim);
+
+          size_t reloaded = 0;
+          for (uint32_t i = 0; i < npts; i++) {
+              TagT t;
+              ifs.read((char*)&t, sizeof(TagT));
+              ifs.read((char*)vec.data(), sizeof(T) * dim);
+
+              if (idx->insert_point(vec.data(), _paras_mem, t) == 0)
+                  reloaded++;
+          }
+
+          ifs.close();
+          std::remove(pfile.c_str());  // consume-once
+
+          _mem_points_by_key[key] += reloaded;
+          _mem_points += reloaded;
+          total_reloaded += reloaded;
+
+          std::cerr << "[C3-3b] reloaded deferred partition ("
+                    << label << ","
+                    << tenant << ") "
+                    << reloaded << " pts into active slot"
+                    << std::endl;
+      }
+
+      man.close();
+      std::remove(manpath.c_str());  // consume-once
+
+      std::cerr << "[C3-3b] total reloaded deferred pts = "
+                << total_reloaded
+                << std::endl;
+  }
+
+  template<typename T, typename TagT>
   void MergeInsert<T, TagT>::merge(const std::string& mem_file,
                                   bool apply_deletes) {
       std::vector<std::string> mem_in{mem_file};
@@ -736,12 +859,16 @@ namespace diskann {
     }
 
   // C3 3a: post-drain partition census (evidence for M5.4 a/b/d).
+  // C3 3b: also record the deferred key set for staging persistence. 
   {
       auto& merged = (_active_index == 0) ? _mem_index_1 : _mem_index_0;
+      _last_deferred.clear();
 
       for (auto& kv : merged) {
           bool deferred =
               _has_selection && _merge_selection.count(kv.first) == 0;
+          if(deferred)
+            _last_deferred.push_back(kv.first);
 
           std::cerr << "[C3] post-drain partition " << kv.first.label << ","
                     << kv.first.tenant << " pts=" << kv.second->get_num_points()

@@ -619,6 +619,30 @@ void update(const std::string& data_bin, const unsigned L_disk,
     }
   }
 
+  // C3 3b: restore scheduler queue + deferred staged partitions across restart.
+  if (g_sched_mode == "priority") {
+    if (const char* sf = std::getenv("SCHED_STATE_FILE")) {
+      std::ifstream sfs(sf);
+      if (sfs.is_open()) {
+        std::stringstream ss;
+        ss << sfs.rdbuf();
+
+        g_sched.deserialize(ss.str());
+
+        // env config wins over persisted config (workload state = tasks only):
+        g_sched.configure(g_c3_a1, g_c3_a2, g_c3_a3, g_c3_a4, (size_t) g_c3_B,
+                          (size_t) g_c3_high_water, (size_t) g_c3_low_water,
+                          g_c3_sched_dr);
+
+        std::cout << "[C3-3b] restored scheduler queue: "
+                  << g_sched.pending_count() << " pending task(s)" << std::endl;
+      }
+
+      // reload deferred staged points into the active slot (no-op if absent)
+      sync_index.load_deferred_staging(std::string(sf) + ".staging");
+    }
+  }
+
   LOG(INFO) << "index npts: " << index_npts
             << " vecs per step: " << vecs_per_step << " ckpt_i: " << ckpt_i
             << " merge ratio: " << merge_ratio << " res: " << res;
@@ -748,15 +772,19 @@ void update(const std::string& data_bin, const unsigned L_disk,
         // Stats over the FULL pending set at t_now (before draining).
         std::vector<diskann::RepairTask> snap = g_sched.snapshot();
 
-        double kmin = std::numeric_limits<double>::infinity();
-        double kmax = -std::numeric_limits<double>::infinity();
+        double kmin = 0.0;
+        double kmax = 0.0;
 
-        for (auto& t : snap) {
-          double k = g_sched.kappa(t, t_now);
-          if (k < kmin)
-            kmin = k;
-          if (k > kmax)
-            kmax = k;
+        for (size_t si = 0; si < snap.size(); ++si) {
+          double k = g_sched.kappa(snap[si], t_now);
+          if (si == 0) {
+            kmin = kmax = k;
+          } else {
+            if (k < kmin)
+              kmin = k;
+            if (k > kmax)
+              kmax = k;
+          }
         }
 
         std::vector<diskann::RepairTask> selected =
@@ -840,6 +868,26 @@ void update(const std::string& data_bin, const unsigned L_disk,
         sync_search_kernel(query, query_num, query_aligned_dim, recall_at,
                            Lsearch[0], sync_index, currentFileName, false,
                            true);
+      }
+
+      // C3 3b: persist deferred scheduler queue + staged points before exit(0).
+      // Guarded on "something deferred" => default/anchor writes nothing.
+      if (g_sched_mode == "priority") {
+        if (const char* sf = std::getenv("SCHED_STATE_FILE")) {
+          if (g_sched.pending_count() > 0) {  // deferred tasks remain
+            sync_index.save_deferred_staging(std::string(sf) + ".staging");
+
+            std::ofstream os(sf, std::ios::trunc);
+            os << g_sched
+                      .serialize();  // holds only deferred after select_batch
+            os.close();
+
+            std::cout << "[C3-3b] persisted scheduler ("
+                      << g_sched.pending_count()
+                      << " deferred task(s)) + staging before exit"
+                      << std::endl;
+          }
+        }
       }
 
       std::cout << "Merge finished for checkpoint " << ckpt;
