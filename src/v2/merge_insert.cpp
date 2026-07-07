@@ -553,6 +553,19 @@ namespace diskann {
   }
 
   template<typename T, typename TagT>
+  void MergeInsert<T, TagT>::set_merge_selection(
+      const std::vector<PartitionKey>& keys) {
+      _merge_selection.clear();
+      for (const auto& k : keys)
+          _merge_selection.insert(k);
+
+      _has_selection = true;
+
+      std::cerr << "[C3] merge_selection set: " << _merge_selection.size()
+                << " partition(s)" << std::endl;
+  }
+
+  template<typename T, typename TagT>
   void MergeInsert<T, TagT>::merge(const std::string& mem_file,
                                   bool apply_deletes) {
       std::vector<std::string> mem_in{mem_file};
@@ -647,6 +660,8 @@ namespace diskann {
       _active_index = 1 - _active_index;
       _mem_points = 0;
       for (auto& kv : _mem_points_by_key) {
+        if (_has_selection && _merge_selection.count(kv.first) == 0)
+          continue;
         kv.second = 0;
       }
       expected_value = true;
@@ -685,6 +700,8 @@ namespace diskann {
         {
           std::unique_lock<std::shared_timed_mutex> lock(_clear_lock_1);
           for (auto& kv : _mem_index_1) {
+            if (_has_selection && _merge_selection.count(kv.first) == 0) // leave deffered partition intact (searchable)
+              continue;
             kv.second = std::make_shared<diskann::Index<T, TagT>>(
               _dist_metric, _dim, _merge_th * 2, 1, _single_file_index, 1);
           }
@@ -702,6 +719,8 @@ namespace diskann {
         std::unique_lock<std::shared_timed_mutex> lock(_clear_lock_0);
         {
           for (auto& kv : _mem_index_0) {
+            if (_has_selection && _merge_selection.count(kv.first) == 0) // leave deffered partition intact (searchable)
+              continue;
             kv.second = std::make_shared<diskann::Index<T, TagT>>(
               _dist_metric, _dim, _merge_th * 2, 1, _single_file_index, 1);
           }
@@ -715,6 +734,24 @@ namespace diskann {
       }
       // if merge() has returned, clear older active index
     }
+
+  // C3 3a: post-drain partition census (evidence for M5.4 a/b/d).
+  {
+      auto& merged = (_active_index == 0) ? _mem_index_1 : _mem_index_0;
+
+      for (auto& kv : merged) {
+          bool deferred =
+              _has_selection && _merge_selection.count(kv.first) == 0;
+
+          std::cerr << "[C3] post-drain partition " << kv.first.label << ","
+                    << kv.first.tenant << " pts=" << kv.second->get_num_points()
+                    << (deferred ? " DEFERRED" : " drained")
+                    << std::endl;
+      }
+  }
+
+  _has_selection = false;  // one merge per process; reset for safety
+
   }
 
   template<typename T, typename TagT>
@@ -738,9 +775,16 @@ namespace diskann {
       // cadence -> topology parity. Avoids the StreamingMerger N-file path
       // (which corrupts/degrades the graph) AND the N-sequential-merge path
       // (which shrinks effective merge size => recall decay).
+      // C3 3a: fold ONLY the selected partitions (defer the rest). is_selected
+      // is always true when no selection set => identical to C2 fold-all.
+      auto is_selected = [&](const PartitionKey& k) {
+          return !_has_selection || _merge_selection.count(k) > 0;
+      };
+
       size_t total_pts = 0;
       for (auto& kv : buf)
-          total_pts += kv.second->get_num_points();
+          if (is_selected(kv.first))
+              total_pts += kv.second->get_num_points();
 
       if (total_pts == 0) {
           partition(buf, PartitionKey{})->save(save_path.c_str());
@@ -754,6 +798,9 @@ namespace diskann {
 
       size_t copied = 0;
       for (auto& kv : buf) {
+          if (!is_selected(kv.first))
+              continue;
+
           if (kv.second->get_num_points() == 0)
               continue;
 

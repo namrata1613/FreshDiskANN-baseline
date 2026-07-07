@@ -1,4 +1,7 @@
 #include "v2/merge_insert.h"
+#include "v2/repair_scheduler.h"
+#include <unordered_set>
+#include <limits>
 #include <fstream>
 #include <cstdlib>
 #include <cstdint>
@@ -74,6 +77,18 @@ int      g_ckpt_idx = 0;
 int      g_batch_idx = -1;
 uint64_t g_cumulative_inserts = 0;
 int      g_is_merge_boundary = 0;
+double   g_c3_a1 = 1.0, g_c3_a2 = 0.0, g_c3_a3 = 1.0,
+       g_c3_a4 = 0.0;  // anchor defaults
+uint64_t                 g_c3_B = 0, g_c3_high_water = 0, g_c3_low_water = 0;
+bool                     g_c3_sched_dr = false;
+uint32_t                 g_c3_sla_default = 1;
+diskann::RepairScheduler g_sched;
+
+// C3 3a drain telemetry (published at the merge trigger, read by
+// emit_telemetry_row)
+size_t   g_sched_pending = 0, g_sched_drained = 0;
+double   g_sched_kappa_min = 0.0, g_sched_kappa_max = 0.0;
+uint64_t g_sched_max_stale_drained = 0, g_sched_max_stale_deferred = 0;
 
 template<typename T, typename TagT>
 void emit_telemetry_row(diskann::MergeInsert<T, TagT>& sync_index, float recall,
@@ -94,7 +109,11 @@ void emit_telemetry_row(diskann::MergeInsert<T, TagT>& sync_index, float recall,
            "recall_at_10,p99_latency_ms,disk_deleted_ids,mean_disk_ios,"
            "cache_mode,sched_mode,io_engine,is_merge_boundary,"
            "l_pred,t_cnt,n_partitions_active,n_partitions_merging,"
-           "mem_index_bytes,probed_partition_occupancy\n";
+           "mem_index_bytes,probed_partition_occupancy,"
+           "mem_index_bytes,probed_partition_occupancy,"
+           "sched_pending_tasks,sched_drained_tasks,sched_kappa_min,"
+           "sched_kappa_max,sched_max_stale_drained,sched_max_stale_deferred\n";
+    ;
   }
 
   size_t deletion_total = 0;
@@ -144,8 +163,10 @@ void emit_telemetry_row(diskann::MergeInsert<T, TagT>& sync_index, float recall,
       << "," << g_is_merge_boundary << "," << sync_index._L_pred << ","
       << sync_index._T_cnt << "," << n_partitions_active << ","
       << n_partitions_merging << "," << mem_index_bytes << ","
-      << probed_partition_occupancy
-      << std::endl;  // std::endl flushes -> row durable before any exit(0)
+      << probed_partition_occupancy << "," << g_sched_pending << ","
+      << g_sched_drained << "," << g_sched_kappa_min << "," << g_sched_kappa_max
+      << "," << g_sched_max_stale_drained << "," << g_sched_max_stale_deferred
+      << std::endl;  // std::endl flushes -> row durable before any exit()
 
   long          vmhwm_kb = 0;
   std::ifstream stfile("/proc/self/status");
@@ -677,6 +698,27 @@ void update(const std::string& data_bin, const unsigned L_disk,
 
     res += vecs_per_step;
     g_cumulative_inserts = res;  // phase 2 telemetry
+
+    // C3 (Agent 2): populate the scheduler from the C2 per-partition occupancy
+    // map. s_w = current cumulative-insert count (logical time); push_or_update
+    // keeps the EARLIEST s_w, so a partition retains its create time. One
+    // upsert per touched key per batch. Only meaningful under priority.
+    if (g_sched_mode == "priority") {
+      for (auto& kv : sync_index._mem_points_by_key) {
+        if (kv.second == 0)
+          continue;  // skip drained/empty partitions
+
+        diskann::RepairTask t;
+        t.key = kv.first;
+        t.occupancy = kv.second;
+        t.dr_proxy = (float) kv.second;     // occupancy proxy (dr term gated)
+        t.s_w = res;                        // current count; earliest kept
+        t.tightest_sla = g_c3_sla_default;  // uniform this ask
+
+        g_sched.push_or_update(t);
+      }
+    }
+
     currentFileName = GetTruthFileName(truthset_file, res);
     ShowMemoryStatus();
 
@@ -688,12 +730,89 @@ void update(const std::string& data_bin, const unsigned L_disk,
     if (i == batch - 1) {
       std::cout << "Done" << std::endl;
       exit(0);
-    } else if (inMemorySize >= Merge_Size) {
-      std::cout << "Begin Merge" << std::endl;
+    } else if (inMemorySize >= (int) ((g_sched_mode == "priority")
+                                          ? g_c3_high_water
+                                          : (uint64_t) Merge_Size)) {
+      std::cout << " Begin Merge" << std::endl;
+
+      // C3 (Agent 2): priority delegation. Under default config
+      // (B = Merge_Size, high_water = Merge_Size, uniform SLA) select_batch
+      // returns ALL pending partitions => same combined merge as FIFO. The
+      // ACTUAL drain stays the unchanged C2 combined single-merge (final_merge
+      // drains all partitions of the active slot); the selective subset
+      // that would honor a partial "selected" set is Agent 3 (needs
+      // merge_insert.*). We do NOT modify merge_insert here (J1 preserved).
+      if (g_sched_mode == "priority") {
+        uint64_t t_now = res;  // cumulative-insert count = logical time
+
+        // Stats over the FULL pending set at t_now (before draining).
+        std::vector<diskann::RepairTask> snap = g_sched.snapshot();
+
+        double kmin = std::numeric_limits<double>::infinity();
+        double kmax = -std::numeric_limits<double>::infinity();
+
+        for (auto& t : snap) {
+          double k = g_sched.kappa(t, t_now);
+          if (k < kmin)
+            kmin = k;
+          if (k > kmax)
+            kmax = k;
+        }
+
+        std::vector<diskann::RepairTask> selected =
+            g_sched.select_batch(t_now, (size_t) g_c3_B);
+
+        auto packk = [](const diskann::PartitionKey& k) {
+          return ((uint64_t) k.label << 32) ^ (uint64_t) k.tenant;
+        };
+
+        std::unordered_set<uint64_t>       sel_ids;
+        std::vector<diskann::PartitionKey> selkeys;
+
+        uint64_t max_stale_drained = 0, max_stale_deferred = 0;
+
+        for (auto& t : selected) {
+          sel_ids.insert(packk(t.key));
+          selkeys.push_back(t.key);
+
+          uint64_t st = (t_now >= t.s_w) ? (t_now - t.s_w) : 0;
+          if (st > max_stale_drained)
+            max_stale_drained = st;
+        }
+
+        for (auto& t : snap) {
+          if (sel_ids.count(packk(t.key)))
+            continue;
+
+          uint64_t st = (t_now >= t.s_w) ? (t_now - t.s_w) : 0;
+          if (st > max_stale_deferred)
+            max_stale_deferred = st;
+        }
+
+        g_sched_pending = snap.size();
+        g_sched_drained = selected.size();
+        g_sched_kappa_min = snap.empty() ? 0.0 : kmin;
+        g_sched_kappa_max = snap.empty() ? 0.0 : kmax;
+        g_sched_max_stale_drained = max_stale_drained;
+        g_sched_max_stale_deferred = max_stale_deferred;
+
+        sync_index.set_merge_selection(selkeys);  // gate the merge to selected
+
+        std::cout << "[C3] drain t_now=" << t_now << " B=" << g_c3_B
+                  << " pending=" << g_sched_pending
+                  << " drained=" << g_sched_drained << " kappa=["
+                  << g_sched_kappa_min << "," << g_sched_kappa_max << "]"
+                  << " max_stale_drained=" << g_sched_max_stale_drained
+                  << " max_stale_deferred=" << g_sched_max_stale_deferred
+                  << std::endl;
+      }
+
       merge_future = std::async(std::launch::async, merge_kernel<T, TagT>,
                                 std::ref(sync_index), std::ref(save_path));
+
       std::this_thread::sleep_for(std::chrono::seconds(5));
-      std::cout << "Sending Merge" << std::endl;
+      std::cout << " Sending Merge" << std::endl;
+
       inMemorySize = 0;
       std::future_status merge_status;
       do {
@@ -708,7 +827,23 @@ void update(const std::string& data_bin, const unsigned L_disk,
       emit_telemetry_row(sync_index, -1.0f, 0.0f, 0.0f,
                          false);  // post merge snapshot
       g_is_merge_boundary = 0;
+
+      if (g_sched_mode == "priority" &&
+          std::getenv("C3_INPROC_PROBE") != nullptr) {
+        std::cout << "[C3] in-process deferred-served probe (post-drain,"
+                  << " pre-exit)" << std::endl;
+
+        // Deferred partitions are still staged in the inactive slot here;
+        // search_sync probes BOTH slots (unchanged C2 path) => this recall
+        // reflects deferred contribution. Compare vs the same run with
+        // C3_HIGH_WATER=Merge_Size (no deferral) to see they still serve.
+        sync_search_kernel(query, query_num, query_aligned_dim, recall_at,
+                           Lsearch[0], sync_index, currentFileName, false,
+                           true);
+      }
+
       std::cout << "Merge finished for checkpoint " << ckpt;
+
       exit(0);  // wait for reboot.
     }
   }
@@ -753,6 +888,8 @@ int main(int argc, char** argv) {
       g_cache_mode = argv[++i];
     } else if (a == "--sched-mode" && i + 1 < argc) {
       g_sched_mode = argv[++i];
+    } else if (a == "--sched-dr") {  // C3: enable dr term (flag, no value)
+      g_c3_sched_dr = true;
     } else {
       Lsearch.push_back(std::atoi(argv[i]));
     }
@@ -778,8 +915,44 @@ int main(int argc, char** argv) {
   if (g_cache_mode == "filter-tenant")
     std::cout << "filter-tenant: query-path routing active" << std::endl;
 
+  // scheduler config from env, contract defaults when unset.
+  // Merge_Size is already parsed above, so B/high_water default to it.
+  {
+    auto envd = [](const char* k, double d) {
+      const char* e = std::getenv(k);
+      return e ? std::atof(e) : d;
+    };
+
+    auto envu = [](const char* k, uint64_t d) {
+      const char* e = std::getenv(k);
+      return e ? (uint64_t) std::strtoull(e, nullptr, 10) : d;
+    };
+
+    g_c3_a1 = envd("C3_ALPHA1", 1.0);
+    g_c3_a2 = envd("C3_ALPHA2", 0.0);
+    g_c3_a3 = envd("C3_ALPHA3", 1.0);
+    g_c3_a4 = envd("C3_ALPHA4", 0.0);
+
+    g_c3_B = envu("C3_B", (uint64_t) Merge_Size);
+    g_c3_high_water = envu("C3_HIGH_WATER", (uint64_t) Merge_Size);
+    g_c3_low_water = envu("C3_LOW_WATER", 0);
+
+    g_c3_sla_default =
+        (uint32_t) envu("C3_SLA_DEFAULT", 1);  // uniform => insert
+    // C3_SLA_TIERS / C3_SLA_FILE reserved for Agent 3 / 2E - NOT parsed here.
+
+    g_sched.configure(g_c3_a1, g_c3_a2, g_c3_a3, g_c3_a4, (size_t) g_c3_B,
+                      (size_t) g_c3_high_water, (size_t) g_c3_low_water,
+                      g_c3_sched_dr);
+  }
+
   if (g_sched_mode == "priority")
-    std::cout << "priority: not yet implemented (routing to fifo)" << std::endl;
+    std::cout << "[C3] sched_mode=priority alpha=(" << g_c3_a1 << "," << g_c3_a2
+              << "," << g_c3_a3 << "," << g_c3_a4 << ")"
+              << " B=" << g_c3_B << " high_water=" << g_c3_high_water
+              << " low_water=" << g_c3_low_water
+              << " sched_dr=" << (g_c3_sched_dr ? "on" : "off")
+              << " sla_default=" << g_c3_sla_default << std::endl;
 
   if (const char* tcsv = std::getenv("TELEMETRY_CSV"))
     g_telemetry_csv = tcsv;

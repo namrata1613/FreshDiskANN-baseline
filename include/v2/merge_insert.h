@@ -21,6 +21,7 @@
 #include <stack>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include "parameters.h"
@@ -84,6 +85,7 @@ namespace diskann {
     DISKANN_DLLEXPORT int trigger_merge();
 
     DISKANN_DLLEXPORT void final_merge();
+    DISKANN_DLLEXPORT void set_merge_selection(const std::vector<PartitionKey>& keys);
 
     DISKANN_DLLEXPORT std::string ret_merge_prefix();
 
@@ -161,6 +163,9 @@ namespace diskann {
 
     std::vector<const std::vector<TagT>*> _deleted_tags_vector;
     std::vector<std::string> _drain_files;  // per partition mem files drained this merge
+
+    std::unordered_set<PartitionKey, PartitionKeyHash> _merge_selection;  // C3 3a
+    bool _has_selection = false;                                          // C3 3a
 
     int              _active_index = 0;  // reflects value of writable index
     int              _active_delete_set = 0;  // reflects active _deletion_set
