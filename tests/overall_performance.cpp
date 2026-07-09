@@ -10,6 +10,7 @@
 #include <index.h>
 #include <cstddef>
 #include <future>
+#include <random>
 #include <Neighbor_Tag.h>
 #include <numeric>
 #include <omp.h>
@@ -481,25 +482,72 @@ template<typename T, typename TagT = uint32_t>
 void get_trace(std::string data_bin, uint64_t l_start, uint64_t r_start,
                uint64_t n, std::vector<TagT>& delete_tags,
                std::vector<TagT>& insert_tags, std::vector<T>& data_load) {
-  for (uint64_t i = l_start; i < l_start + n; ++i) {
+  for (uint64_t i = l_start; i < l_start + n; ++i)
     delete_tags.push_back(i);
-  }
 
-  for (uint64_t i = r_start; i < r_start + n; ++i) {
+  for (uint64_t i = r_start; i < r_start + n; ++i)
     insert_tags.push_back(i);
-  }
 
-  // load data, load n vecs from r_start.
   int           npts_i32, dim_i32;
   std::ifstream reader(data_bin, std::ios::binary | std::ios::ate);
+
   reader.seekg(0, reader.beg);
   reader.read((char*) &npts_i32, sizeof(int));
   reader.read((char*) &dim_i32, sizeof(int));
 
   size_t data_dim = dim_i32;
   data_load.resize(n * data_dim);
+
   reader.seekg(2 * sizeof(int) + r_start * data_dim * sizeof(T), reader.beg);
   reader.read((char*) data_load.data(), sizeof(T) * n * data_dim);
+
+  // ---- Task 1 (2B.5): seeded insert-order permutation, default OFF ----
+  // C2_SEED unset  => no permutation => byte-identical to today (anchor safe).
+  // C2_SEED=<n>    => deterministic per-(seed,window) shuffle of the
+  //                  (tag,vector) pairs. Same point set at every res
+  //                  (gt_<res>.bin still matches), different realized order.
+  //
+
+  if (const char* se = std::getenv("C2_SEED")) {
+    uint64_t        seed = std::strtoull(se, nullptr, 10);
+    std::mt19937_64 rng(seed ^ (0x9E3779B97F4A7C15ULL * (r_start + 1)));
+
+    std::vector<uint64_t> perm(n);
+    std::iota(perm.begin(), perm.end(), 0ull);
+
+    for (uint64_t i = n; i-- > 1;) {
+      std::uniform_int_distribution<uint64_t> d(0, i);
+      std::swap(perm[i], perm[d(rng)]);
+    }
+
+    std::vector<TagT> it2(n);
+    std::vector<T>    dl2(n * data_dim);
+
+    for (uint64_t i = 0; i < n; ++i) {
+      it2[i] = insert_tags[perm[i]];
+
+      std::memcpy(dl2.data() + i * data_dim,
+                  data_load.data() + perm[i] * data_dim, data_dim * sizeof(T));
+    }
+
+    insert_tags.swap(it2);
+    data_load.swap(dl2);
+
+    uint64_t h = 1469598103934665603ULL;  // FNV-1a over realized tag order
+
+    for (uint64_t i = 0; i < n; ++i) {
+      uint64_t v = (uint64_t) insert_tags[i];
+      for (int b = 0; b < 8; ++b) {
+        h ^= (v & 0xff);
+        h *= 1099511628211ULL;
+        v >>= 8;
+      }
+    }
+
+    std::cout << "[C2_SEED] seed=" << seed << " window_r_start=" << r_start
+              << " n=" << n << " realized_order_fnv1a=0x" << std::hex << h
+              << std::dec << std::endl;
+  }
 }
 
 template<typename T, typename TagT>
@@ -559,11 +607,15 @@ void update(const std::string& data_bin, const unsigned L_disk,
   uint64_t vecs_per_step = index_npts / step;
   double   merge_ratio = ((double) Merge_Size / index_npts);
 
+  uint64_t per_ckpt_inserts = (g_sched_mode == "priority")
+                                  ? (uint64_t) g_c3_high_water
+                                  : (uint64_t) Merge_Size;
+
   uint64_t ckpt_i = 0, res = 0, tmp_npts = index_npts;
   for (int i = 0; i < ckpt; ++i) {
-    res += Merge_Size;
-    ckpt_i += Merge_Size / vecs_per_step;
-    tmp_npts += Merge_Size;
+    res += per_ckpt_inserts;
+    ckpt_i += per_ckpt_inserts / vecs_per_step;
+    tmp_npts += per_ckpt_inserts;
     // Merge_Size =
     //     ((uint32_t) (merge_ratio * tmp_npts)) / vecs_per_step *
     //     vecs_per_step;

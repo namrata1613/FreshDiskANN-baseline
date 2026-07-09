@@ -86,6 +86,8 @@ namespace diskann {
 
     DISKANN_DLLEXPORT void final_merge();
     DISKANN_DLLEXPORT void set_merge_selection(const std::vector<PartitionKey>& keys);
+    DISKANN_DLLEXPORT void save_deferred_staging(const std::string& prefix);
+    DISKANN_DLLEXPORT void load_deferred_staging(const std::string& prefix);
 
     DISKANN_DLLEXPORT std::string ret_merge_prefix();
 
@@ -166,6 +168,7 @@ namespace diskann {
 
     std::unordered_set<PartitionKey, PartitionKeyHash> _merge_selection;  // C3 3a
     bool _has_selection = false;                                          // C3 3a
+    std::vector<PartitionKey> _last_deferred;
 
     int              _active_index = 0;  // reflects value of writable index
     int              _active_delete_set = 0;  // reflects active _deletion_set
