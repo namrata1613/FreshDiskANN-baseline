@@ -59,6 +59,7 @@ struct RepairTask {
     uint32_t tightest_sla = 0;  // tightest SLO across key.tenant's set
     size_t occupancy = 0;       // points staged in this partition
     float dr_proxy = 0.0f;      // occupancy (or occupancy^2); dr term only
+    uint64_t ceiling = std::numeric_limits<uint64_t>::max(); 
 };
 
 class RepairScheduler {
@@ -93,6 +94,7 @@ class RepairScheduler {
             cur.occupancy = t.occupancy;
             cur.dr_proxy = t.dr_proxy;
             cur.tightest_sla = t.tightest_sla;
+            cur.ceiling = t.ceiling;
         }
     }
 
@@ -148,6 +150,114 @@ class RepairScheduler {
     return selected;
 }
 
+    // -----------------------------------------------------------------------------
+    // per-tenant max-staleness ceiling (SLA hard guarantee)
+    // -----------------------------------------------------------------------------
+
+    struct DrainResult {
+        std::vector<RepairTask> selected;      // forced ∪ kappa-selected
+        size_t forced_count = 0;               // # units force-drained (past ceiling)
+        size_t forced_occupancy = 0;           // points in the forced set
+        bool forced_overflow = false;          // forced_occupancy > B (contract [D5b-2])
+    };
+
+    // [D5b-1] Force-drain past-ceiling units BEFORE kappa-selection: any task
+    // with stale(t_now) >= ceiling is force-selected regardless of kappa. The
+    // remaining budget B is then filled by descending kappa over the rest (same
+    // rule as select_batch). Non-selected tasks are retained in pending.
+    //
+    // [D5b-2] select-not-resize: the union is ONE combined merge, size <= B,
+    // EXCEPT when the forced set alone exceeds B -> drain all forced (size may
+    // be > B), still one merge, flag forced_overflow. Never subdivide.
+    //
+    // Under all-infinite ceilings the forced set is empty and the kappa fill is
+    // computed over the full pending set => identical to select_batch (anchor).
+
+    DrainResult select_batch_ceiling(uint64_t t_now, size_t B)
+    {
+        DrainResult res;
+
+        std::vector<RepairTask> forced;
+        std::vector<RepairTask> rest;
+
+        forced.reserve(_pending.size());
+        rest.reserve(_pending.size());
+
+        const uint64_t NO_CEIL = std::numeric_limits<uint64_t>::max();
+
+        for (const auto& kv : _pending) {
+            const RepairTask& t = kv.second;
+
+            uint64_t st = (t_now >= t.s_w) ? (t_now - t.s_w) : 0;
+
+            if (t.ceiling != NO_CEIL && st >= t.ceiling)
+                forced.push_back(t);
+            else
+                rest.push_back(t);
+        }
+
+        size_t sum = 0;
+
+        for (const auto& t : forced) {
+            res.selected.push_back(t);
+            sum += t.occupancy;
+        }
+
+        res.forced_count = forced.size();
+        res.forced_occupancy = sum;
+        res.forced_overflow = (sum > B);
+
+        std::unordered_map<PartitionKey, RepairTask, PartitionKeyHash> remaining;
+
+        if (sum > B) {
+            // Budget already met/exceeded by the forced set -> no kappa fill.
+            for (const auto& t : rest)
+                remaining.emplace(t.key, t);
+        } else {
+            // Fill remaining budget by descending kappa over rest.
+            TermStats stx = compute_stats_over(rest, t_now);
+
+            std::vector<std::pair<double, size_t>> scored;
+            scored.reserve(rest.size());
+
+            for (size_t i = 0; i < rest.size(); ++i)
+                scored.emplace_back(kappa_with_stats(rest[i], t_now, stx), i);
+
+            std::sort(
+                scored.begin(),
+                scored.end(),
+                [&](const std::pair<double, size_t>& x,
+                    const std::pair<double, size_t>& y) {
+                    if (x.first != y.first)
+                        return x.first > y.first; // descending kappa
+
+                    return key_less(
+                        rest[x.second].key,
+                        rest[y.second].key);       // ascending tie-break
+                });
+
+            bool budget_met = false;
+
+            for (const auto& s : scored) {
+                const RepairTask& tsk = rest[s.second];
+
+                if (!budget_met) {
+                    res.selected.push_back(tsk);
+                    sum += tsk.occupancy;
+
+                    if (sum >= B)
+                        budget_met = true;
+                } else {
+                    remaining.emplace(tsk.key, tsk);
+                }
+            }
+        }
+
+        _pending.swap(remaining);
+        return res;
+    }
+
+
     size_t pending_count() const {
         return _pending.size();
     }
@@ -188,7 +298,7 @@ class RepairScheduler {
     std::ostringstream os;
     os.precision(std::numeric_limits<double>::max_digits10);
 
-    os << "RSCHED1\n";
+    os << "RSCHED2\n";
     os << _a1 << ' ' << _a2 << ' ' << _a3 << ' ' << _a4 << ' '
        << _B << ' ' << _high_water << ' ' << _low_water << ' '
        << (_dr_enabled ? 1 : 0) << '\n';
@@ -201,7 +311,8 @@ class RepairScheduler {
            << t.s_w << ' '
            << t.tightest_sla << ' '
            << t.occupancy << ' '
-           << float_bits(t.dr_proxy) << '\n';
+           << float_bits(t.dr_proxy) << ' '
+           << t.ceiling << '\n';
     }
 
     return os.str();
@@ -213,8 +324,8 @@ void deserialize(const std::string& blob) {
     std::istringstream is(blob);
     std::string magic;
 
-    is >> magic;               // "RSCHED1"
-
+    is >> magic;               // "RSCHED2"
+    const bool has_ceiling = (magic == "RSCHED2");
     int dr_flag = 0;
     is >> _a1 >> _a2 >> _a3 >> _a4
        >> _B >> _high_water >> _low_water >> dr_flag;
@@ -226,6 +337,8 @@ void deserialize(const std::string& blob) {
 
     for (size_t i = 0; i < n; ++i) {
         RepairTask t;
+        if (has_ceiling)
+            is >> t.ceiling;
 
         uint32_t bits = 0;
 
@@ -267,6 +380,36 @@ void deserialize(const std::string& blob) {
 
     static double norm(double v, double lo, double hi) {
         return (hi == lo) ? 0.0 : (v - lo) / (hi - lo);
+    }
+
+    TermStats compute_stats_over(const std::vector<RepairTask>& v, uint64_t t_now) const { 
+        TermStats st;
+        if (v.empty())
+            return st;
+
+        double lim = std::numeric_limits<double>::infinity();
+
+        st.min_stale = st.min_dr = st.min_sla = lim;
+        st.max_stale = st.max_dr = st.max_sla = -lim;
+
+        for (const auto& t : v) {
+
+            double s = stale_raw(t, t_now);
+            double d = static_cast<double>(t.dr_proxy);
+            double a = sla_raw(t);
+
+            st.min_stale = std::min(st.min_stale, s);
+            st.max_stale = std::max(st.max_stale, s);
+
+            st.min_dr = std::min(st.min_dr, d);
+            st.max_dr = std::max(st.max_dr, d);
+
+            st.min_sla = std::min(st.min_sla, a);
+            st.max_sla = std::max(st.max_sla, a);
+        }
+
+        return st;
+        
     }
 
     TermStats compute_stats(uint64_t t_now) const {
