@@ -103,6 +103,7 @@ uint64_t g_sched_max_stale_drained = 0, g_sched_max_stale_deferred = 0;
 // -----------------------------------------------------------------------------
 
 bool g_c3_ceiling_enabled = false;
+bool g_c3_ceiling_enforce = false;   // enforce ceiling (true) vs measure-only (false)
 
 // tenant -> ceiling
 std::unordered_map<uint32_t, uint64_t> g_ceiling_of_tenant;
@@ -810,6 +811,102 @@ void update(const std::string& data_bin, const unsigned L_disk,
 
       // reload deferred staged points into the active slot (no-op if absent)
       sync_index.load_deferred_staging(std::string(sf) + ".staging");
+      
+      // ----- C3 drain-to-empty tail (confirmatory; env-gated, default-off) -----
+      // No inserts: drain the reloaded backlog in <=B chunks (never one oversized
+      // terminal merge). Repeated invocations (bash loop) until deferred_backlog==0.
+
+      if (g_sched_mode == "priority" && std::getenv("C3_DRAIN_TO_EMPTY")) {
+          uint64_t t_now = res;    // from ckpt replay; >= all s_w
+
+          if (g_sched.pending_count() == 0) {
+              std::cout << "[C3-drain] backlog empty" << std::endl;
+              g_sched_forced_drains = 0;
+              g_sched_forced_overflow = 0;
+              g_sched_deferred_backlog = 0;
+              g_is_merge_boundary = 1;
+              emit_telemetry_row(sync_index, -1.0f, 0.0f, 0.0f, false);
+              exit(0);
+          }
+
+          std::vector<diskann::RepairTask> selected;
+
+          if (g_c3_ceiling_enforce) {
+              auto dres = g_sched.select_batch_ceiling(t_now, (size_t)g_c3_B);
+              selected = dres.selected;
+              g_sched_forced_drains = dres.forced_count;
+              g_sched_forced_overflow = dres.forced_overflow ? 1 : 0;
+
+              if (dres.forced_overflow)
+                  std::cout
+                      << "[C3-drain][ceiling_forced_overflow] forced_occ="
+                      << dres.forced_occupancy
+                      << " > B=" << g_c3_B
+                      << std::endl;
+          } else {
+              selected = g_sched.select_batch(t_now, (size_t)g_c3_B);
+              g_sched_forced_drains = 0;
+              g_sched_forced_overflow = 0;
+          }
+
+          std::vector<diskann::PartitionKey> selkeys;
+          for (auto &t : selected)
+              selkeys.push_back(t.key);
+
+          g_sched_deferred_backlog = g_sched.pending_count();
+
+          if (const char* ml = std::getenv("C3_MERGE_LOG")) {
+              std::ofstream mf(ml, std::ios::app);
+              mf << "MERGE res=" << res
+                << " leg=" << (g_c3_ceiling_enforce ? "enforce" : "fifo")
+                << " forced=" << g_sched_forced_drains
+                << " n=" << selected.size();
+
+              for (const auto& t : selected)
+                  mf << " " << t.key.label << ":" << t.key.tenant << ":" << t.occupancy;
+
+              mf << "\n";
+          }
+
+          sync_index.set_merge_selection(selkeys);
+
+          std::cout
+              << "[C3-drain] t_now=" << t_now
+              << " drained=" << selected.size()
+              << " remaining=" << g_sched_deferred_backlog
+              << std::endl;
+
+          merge_future = std::async(
+              std::launch::async,
+              merge_kernel<T, TagT>,
+              std::ref(sync_index),
+              std::ref(save_path));
+
+          std::future_status ms;
+          do {
+              ms = merge_future.wait_for(std::chrono::seconds(10));
+              ShowMemoryStatus();
+          } while (ms != std::future_status::ready);
+
+          g_is_merge_boundary = 1;
+          emit_telemetry_row(sync_index, -1.0f, 0.0f, 0.0f, false);
+          g_is_merge_boundary = 0;
+
+          // persist ALWAYS (even at pending==0) so the bash loop can detect empty
+          if (const char *sf = std::getenv("SCHED_STATE_FILE")) {
+              std::ofstream os(sf, std::ios::trunc);
+              os << g_sched.serialize();
+              os.close();
+
+              if (g_sched.pending_count() > 0)
+                  sync_index.save_deferred_staging(std::string(sf) + ".staging");
+              else
+                  std::remove((std::string(sf) + ".staging").c_str());
+          }
+
+          exit(0);
+      }
+
     }
   }
 
@@ -964,7 +1061,7 @@ void update(const std::string& data_bin, const unsigned L_disk,
 
         std::vector<diskann::RepairTask> selected;
 
-        if (g_c3_ceiling_enabled) {
+        if (g_c3_ceiling_enforce) {
             diskann::RepairScheduler::DrainResult dres =
                 g_sched.select_batch_ceiling(
                     t_now,
@@ -991,6 +1088,18 @@ void update(const std::string& data_bin, const unsigned L_disk,
 
             g_sched_forced_drains = 0;
             g_sched_forced_overflow = 0;
+        }
+
+        for(const auto& t : snap) {
+          
+          uint64_t st = (t_now >= t.s_w) ? (t_now - t.s_w) : 0;
+          std::cerr << "[C3][dbg] pending: tenant=" << t.key.tenant
+                    << " label=" << t.key.label
+                    << " occ=" << t.occupancy
+                    << " s_w=" << t.s_w
+                    << " staleness=" << st
+                    << " ceiling=" << t.ceiling
+                    << std::endl;
         }
 
         {
@@ -1240,6 +1349,7 @@ int main(int argc, char** argv) {
     }
 
     g_c3_ceiling_enabled = !g_ceiling_of_tenant.empty();
+    g_c3_ceiling_enforce = g_c3_ceiling_enabled && (std::getenv("C3_CEILING_MEASURE_ONLY") == nullptr);
 
     std::cout << "[C3-ceiling] loaded "
               << g_ceiling_of_tenant.size()

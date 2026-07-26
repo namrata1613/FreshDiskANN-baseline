@@ -337,8 +337,7 @@ void deserialize(const std::string& blob) {
 
     for (size_t i = 0; i < n; ++i) {
         RepairTask t;
-        if (has_ceiling)
-            is >> t.ceiling;
+
 
         uint32_t bits = 0;
 
@@ -348,6 +347,9 @@ void deserialize(const std::string& blob) {
            >> t.tightest_sla
            >> t.occupancy
            >> bits;
+        
+        if (has_ceiling)
+            is >> t.ceiling;
 
         t.dr_proxy = bits_float(bits);
 
