@@ -282,7 +282,7 @@ namespace diskann {
       auto idx = std::make_shared<diskann::Index<T, TagT>>(
           this->_dist_metric,
           _dim,
-          2 * _merge_th,
+          (_partition_cap ? _partition_cap : 2 * _merge_th),
           1,
           _single_file_index,
           1);
@@ -758,7 +758,7 @@ namespace diskann {
       // make new index active
       if (_active_index == 0) {
         _mem_index_1[PartitionKey{}] = std::make_shared<diskann::Index<T, TagT>>(
-            this->_dist_metric, _dim, _merge_th * 2, 1, _single_file_index, 1);
+            this->_dist_metric, _dim, (_partition_cap ? _partition_cap : 2 * _merge_th), 1, _single_file_index, 1);
         bool expected_active = false;
         if (_active_1.compare_exchange_strong(expected_active, true)) {
           diskann::cout << "Initialised new index for _mem_index_1 "
@@ -770,7 +770,7 @@ namespace diskann {
 
       } else {
         _mem_index_0[PartitionKey{}] = std::make_shared<diskann::Index<T, TagT>>(
-            this->_dist_metric, _dim, _merge_th * 2, 1, _single_file_index, 1);
+            this->_dist_metric, _dim, (_partition_cap ? _partition_cap : 2 * _merge_th), 1, _single_file_index, 1);
         bool expected_active = false;
         if (_active_0.compare_exchange_strong(expected_active, true)) {
           diskann::cout << "Initialised new index for _mem_index_0 "
@@ -826,7 +826,7 @@ namespace diskann {
             if (_has_selection && _merge_selection.count(kv.first) == 0) // leave deffered partition intact (searchable)
               continue;
             kv.second = std::make_shared<diskann::Index<T, TagT>>(
-              _dist_metric, _dim, _merge_th * 2, 1, _single_file_index, 1);
+              _dist_metric, _dim,  (_partition_cap ? _partition_cap : 2 * _merge_th), 1, _single_file_index, 1);
           }
 
         }
@@ -845,7 +845,7 @@ namespace diskann {
             if (_has_selection && _merge_selection.count(kv.first) == 0) // leave deffered partition intact (searchable)
               continue;
             kv.second = std::make_shared<diskann::Index<T, TagT>>(
-              _dist_metric, _dim, _merge_th * 2, 1, _single_file_index, 1);
+              _dist_metric, _dim, (_partition_cap ? _partition_cap : 2 * _merge_th), 1, _single_file_index, 1);
           }
           
         }
@@ -921,7 +921,7 @@ namespace diskann {
       }
 
       auto combined = std::make_shared<diskann::Index<T, TagT>>(
-          _dist_metric, _dim, 2 * _merge_th, 1, _single_file_index, 1);
+          _dist_metric, _dim, (_partition_cap ? _partition_cap : 2 * _merge_th), 1, _single_file_index, 1);
 
       size_t copied = 0;
       for (auto& kv : buf) {

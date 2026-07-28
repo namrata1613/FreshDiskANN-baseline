@@ -23,6 +23,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <cstdlib>
 
 #include "parameters.h"
 #include "Neighbor_Tag.h"
@@ -56,6 +57,12 @@ namespace diskann {
         std::cerr << "Init mem index with " << npts << " points" << std::endl;
 
         _merge_th = npts;
+        _partition_cap = 20000; //2 * _merge_th;                       // default = today's behavior
+        if (const char* e = std::getenv("C3_PARTITION_CAP")) {
+            unsigned long long c = std::strtoull(e, nullptr, 10);
+            if (c > 0) _partition_cap = (size_t) c;
+        }
+        std::cerr << "[C3] partition capacity = " << _partition_cap << std::endl;
 
         PartitionKey k0{};
         partition(_mem_index_0, k0);
@@ -122,7 +129,7 @@ namespace diskann {
     void merge(const std::string& mem_file, bool apply_deletes);
 
    public:
-    size_t   _merge_th = 0;
+    size_t   _merge_th = 0; size_t _partition_cap = 0;
     size_t   _mem_points = 0;  // reflects number of points in active mem index
     double   _last_merge_ms =0;
     size_t   _num_merges = 0;
