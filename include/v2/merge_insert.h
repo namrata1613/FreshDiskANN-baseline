@@ -57,7 +57,7 @@ namespace diskann {
         std::cerr << "Init mem index with " << npts << " points" << std::endl;
 
         _merge_th = npts;
-        _partition_cap = 20000; //2 * _merge_th;                       // default = today's behavior
+        _partition_cap = 2 * _merge_th;                       // default = today's behavior
         if (const char* e = std::getenv("C3_PARTITION_CAP")) {
             unsigned long long c = std::strtoull(e, nullptr, 10);
             if (c > 0) _partition_cap = (size_t) c;
