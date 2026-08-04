@@ -957,31 +957,28 @@ namespace diskann {
   template<typename T, typename TagT>
   void MergeInsert<T, TagT>::save_del_set() {
     const PartitionKey k0{};
+    const bool multipart = (std::getenv("C3_MULTIPART_TOMBSTONE") != nullptr);  // 3d: default-off
     {
-      fprintf(stderr, "Inside save_del_set()\n");
+      fprintf(stderr, "Inside save_del_set()%s\n", multipart ? " [multipart]" : "");
       bool expected_value = false;
       _check_switch_delete.compare_exchange_strong(expected_value, true);
       std::unique_lock<std::shared_timed_mutex> lock(_delete_lock);
       if (_active_delete_set == 0) {
-        _deletion_set_1[k0].clear();
+        if (multipart) { for (auto& kv : _deletion_set_1) kv.second.clear(); }
+        else           { _deletion_set_1[k0].clear(); }
         bool expected_active = false;
-        if (_active_del_1.compare_exchange_strong(expected_active, true)) {
-          diskann::cout
-              << "Cleared _deletion_set_1 - ready to accept new points"
-              << std::endl;
-        } else {
+        if (_active_del_1.compare_exchange_strong(expected_active, true))
+          diskann::cout << "Cleared _deletion_set_1 - ready to accept new points" << std::endl;
+        else
           diskann::cout << "Failed to clear _deletion_set_1" << std::endl;
-        }
       } else {
-        _deletion_set_0[k0].clear();
+        if (multipart) { for (auto& kv : _deletion_set_0) kv.second.clear(); }
+        else           { _deletion_set_0[k0].clear(); }
         bool expected_active = false;
-        if (_active_del_0.compare_exchange_strong(expected_active, true)) {
-          diskann::cout
-              << "Cleared _deletion_set_0 - ready to accept new points"
-              << std::endl;
-        } else {
+        if (_active_del_0.compare_exchange_strong(expected_active, true))
+          diskann::cout << "Cleared _deletion_set_0 - ready to accept new points" << std::endl;
+        else
           diskann::cout << "Failed to clear _deletion_set_0" << std::endl;
-        }
       }
       _active_delete_set = 1 - _active_delete_set;
       bool expected_active = true;
@@ -993,40 +990,28 @@ namespace diskann {
       _check_switch_delete.compare_exchange_strong(expected_value, false);
     }
 
-    if (_active_delete_set == 0) {
-      std::vector<TagT>* del_vec =
-          new std::vector<TagT>(_deletion_set_1[k0].size());
-
-      size_t i = 0;
-      for (auto iter : _deletion_set_1[k0]) {
-        (*del_vec)[i] = iter;
-        i++;
+    // gather tombstones from the now-inactive (old-active) deletion set
+    auto& src = (_active_delete_set == 0) ? _deletion_set_1 : _deletion_set_0;
+    std::vector<TagT>* del_vec = new std::vector<TagT>();
+    if (multipart) {
+      size_t total = 0, nparts = 0;
+      for (auto& kv : src) total += kv.second.size();
+      del_vec->reserve(total);
+      for (auto& kv : src) {
+        if (!kv.second.empty()) nparts++;
+        for (const auto& tag : kv.second) del_vec->push_back(tag);
       }
-      if (!_deleted_tags_vector.empty()) {
-        for (auto iter : _deleted_tags_vector) {
-          delete (iter);
-        }
-      }
-      _deleted_tags_vector.clear();
-      _deleted_tags_vector.push_back(del_vec);
+      std::cerr << "[C3-tomb] gathered " << del_vec->size()
+                << " tombstones across " << nparts << " partition(s)" << std::endl;
     } else {
-      std::vector<TagT>* del_vec =
-          new std::vector<TagT>(_deletion_set_0[k0].size());
-
+      del_vec->resize(src[k0].size());
       size_t i = 0;
-      for (auto iter : _deletion_set_0[k0]) {
-        (*del_vec)[i] = iter;
-        i++;
-      }
-      if (!_deleted_tags_vector.empty()) {
-        for (auto iter : _deleted_tags_vector) {
-          delete (iter);
-        }
-      }
-
-      _deleted_tags_vector.clear();
-      _deleted_tags_vector.push_back(del_vec);
+      for (auto iter : src[k0]) (*del_vec)[i++] = iter;
     }
+    if (!_deleted_tags_vector.empty())
+      for (auto iter : _deleted_tags_vector) delete (iter);
+    _deleted_tags_vector.clear();
+    _deleted_tags_vector.push_back(del_vec);
   }
 
   template<typename T, typename TagT>
