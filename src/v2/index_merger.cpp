@@ -1383,7 +1383,13 @@ namespace diskann {
     // get max ID + 1 in rename-map as new max pts
     uint32_t new_max_pts = this->disk_npts - 1;
     // alternative using list
-    new_max_pts = std::max(this->inverse_list.back().first, new_max_pts);
+    // Bug B fix (3g): a degenerate fold with 0 net-new points (e.g. a
+    // single-partition FIFO residual re-fold where all mem points are deleted
+    // or already committed) leaves inverse_list empty; .back() on it is UB and
+    // was the deterministic segfault after "Storing mappings for 0 points".
+    // Guard it: an empty fold adds no new points, so new_max_pts stays disk_npts.
+    if (!this->inverse_list.empty())
+      new_max_pts = std::max(this->inverse_list.back().first, new_max_pts);
     new_max_pts = new_max_pts + 1;
 
     // TODO (correct) :: figure out naming scheme

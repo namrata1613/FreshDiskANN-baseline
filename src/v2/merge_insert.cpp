@@ -667,7 +667,7 @@ namespace diskann {
           }
 
           ifs.close();
-          std::remove(pfile.c_str());  // consume-once
+          //std::remove(pfile.c_str());  // consume-once
 
           _mem_points_by_key[key] += reloaded;
           _mem_points += reloaded;
@@ -681,7 +681,7 @@ namespace diskann {
       }
 
       man.close();
-      std::remove(manpath.c_str());  // consume-once
+      //std::remove(manpath.c_str());  // consume-once
 
       std::cerr << "[C3-3b] total reloaded deferred pts = "
                 << total_reloaded

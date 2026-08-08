@@ -1041,10 +1041,6 @@ void update(const std::string& data_bin, const unsigned L_disk,
           ShowMemoryStatus();
         } while (ms != std::future_status::ready);
 
-        g_is_merge_boundary = 1;
-        emit_telemetry_row(sync_index, -1.0f, 0.0f, 0.0f, false);
-        g_is_merge_boundary = 0;
-
         // residual AFTER the merge (switch_index zeroed the drained keys)
         size_t remaining = 0;
         for (auto& kv : sync_index._mem_points_by_key)
@@ -1058,6 +1054,10 @@ void update(const std::string& data_bin, const unsigned L_disk,
           sync_index.save_deferred_staging(std::string(sf) + ".staging");
         else  // manifest is the loop sentinel; removing it terminates the drain
           std::remove((std::string(sf) + ".staging_manifest.txt").c_str());
+
+        g_is_merge_boundary = 1;
+        emit_telemetry_row(sync_index, -1.0f, 0.0f, 0.0f, false);
+        g_is_merge_boundary = 0;
 
         if (remaining ==
             0) {  // index complete -> cache-empty Tier-0b recall (M3, INV-3)
